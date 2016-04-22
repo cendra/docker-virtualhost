@@ -1,0 +1,3 @@
+{
+  "docker": "http://unix:/var/run/docker.sock:"
+}

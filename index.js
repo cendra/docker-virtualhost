@@ -4,22 +4,29 @@ var express=require('express'),
     request = require('request'),
     url = require('url'),
     fs = require('fs'),
-    bodyParser = require('body-parser');
+    bodyParser = require('body-parser'),
+    config = require('./config');
 
 var services = [];
 var fillServices = function() {
   //docker ps --format "{{.Names}}" -f "name=ci-jenk"|grep -w ci-jenk|wc -l
-  exec('docker ps --format "{{.Names}}"', function(error, stdout, stderr) {
-    if(!error) {
-      services = stdout.split(/\s+/).filter(function(service) {
-        return !!service;
-      }).map(function(service) {
-        return service.trim();
-      });
-    } else {
+    request(config.docker+'/containers/json', function(error, response, body) {
       services = [];
-    }
-  });
+      if(!error && response.statusCode == 200) {
+        try {
+          body = JSON.parse(body);
+          body.forEach(function(service) {
+            service.Names.forEach(function(name) {
+              services.push(name.substr(1));
+            });
+          });
+        } catch(e) {
+          console.log(e);
+        }
+      } else {
+        console.log(error||body);
+      }
+    });
 }
 fillServices();
 setInterval(fillServices, 10000);
@@ -37,9 +44,17 @@ app.use(function(req, res, next) {
   if(!(match = req.headers.host.match(/^([^.]+).*$/))) return res.status(404).send("Page Not Found");
   req.serviceName = match[1];
   if(services.indexOf(req.serviceName) === -1) {
-    return exec('docker ps --format "{{.Names}}" -f "name='+req.servicesName+'" | grep -w '+req.servicesName+' | wc -l', function(error, stdout, stderr) {
-      if(!error && stdout!=0) {
-        return next();
+    return request(config.docker+'/containers/'+req.serviceName+'/json', function(error, response, body) {
+      if(!error && response.statusCode == 200) {
+        try {
+          body = JSON.parse(body);
+          if(body.State.Running)
+            return next();
+          else
+            return res.status(503).send("Service  Unavailable");
+        } catch(e) {
+          console.log(e)
+        }
       }
       res.status(404).send("Page Not Found");
     });
