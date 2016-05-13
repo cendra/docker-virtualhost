@@ -10,5 +10,6 @@ WORKDIR /opt/project
 COPY package.json /opt/project/
 RUN npm install
 COPY *.js /opt/project/
-COPY config.json /opt/project/
+COPY config /opt/project/config
+EXPOSE 80
 CMD ["npm", "start"]

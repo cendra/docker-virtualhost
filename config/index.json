@@ -1,0 +1,7 @@
+{
+  "docker": "http://unix:/var/run/docker.sock:",
+  "log": true,
+  "defaultDomain": "unc.edu.ar",
+  "services": {
+  }
+}
