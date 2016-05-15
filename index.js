@@ -24,9 +24,9 @@ var logger = function(req, res, next){
 var services = {};
 var hosts = {};
 var processService = function(service) {
-  var name = body.Name.substr(0, 1) == '/'?body.Name.substr(1):body.Name;
+  var name = service.Name.substr(0, 1) == '/'?service.Name.substr(1):service.Name;
   services[name] = services[name]||{};
-  if(!services[name].ip) services[name].ip = service.NetworkSettings.Networks.bridge.IPAddress;
+  if(!services[name].ip) services[name].ip = service.NetworkSettings.IPAddress;
   if(!services[name].hostname) services[name].hostname = [name+'.'+config.defaultDomain];
   services[name].hostname.forEach(function(host) {
     hosts[host] = services[name];
@@ -48,12 +48,17 @@ var processService = function(service) {
       }
     }
     if(ports.length) {
-      if (porst.indexOf(80)!==-1) {
+      if (ports.indexOf(80)!==-1) {
         services[name].port = 80;
-      } else if (porst.indexOf(443)!==-1) {
+      } else if (ports.indexOf(443)!==-1) {
         services[name].port = 443;
+      } else if (ports.indexOf(8080)!==-1) {
+        services[name].port = 8080;
+      } else if (ports.indexOf(8443)!==-1) {
+        services[name].port = 8443;
+      } else {
+        services[name].port = ports[0];
       }
-      services[name].port = ports[0];
     }
   }
 
@@ -107,54 +112,54 @@ app.use(function(req, res, next) {
 app.use(function(req, res, next) {
   //var hostname = url.parse(req.headers.host).hostname;
   var match;
-  req.debugUrl = false;
+  req.explicitPort = false;
   if(!(match = req.headers.host.match(/^([^.]+)(.*)$/))) return res.status(404).send("Page Not Found");
   var portMatch;
-  if(portMatch = match[1].match(/^(\w)+__(\d)__$/)) {
-    req.debugUrl = true;
-    match[1] = match[1].substr(0, match[1].length-6);
+  if(portMatch = match[1].match(/^(\w+)__(\d+)__$/)) {
+    req.explicitPort = portMatch[2];
+    match[1] = portMatch[1];
   }
-  req.serviceName = match[1];
+  req.hostName = match[1]+match[2];
   req.logger.log('Service Name: '+ req.serviceName);
-  if(!services[req.serviceName]) {
-    return request(config.docker+'/containers/'+req.serviceName+'/json', function(error, response, body) {
-      if(!error && response.statusCode == 200) {
-        try {
-          body = JSON.parse(body);
-          if(body.State.Running)
-            processService(body);
-            return next();
-          else
-            return res.status(503).send("Service  Unavailable");
-        } catch(e) {
-          req.logger.log(e);
+  if(!hosts[req.hostName]) {
+    if(match[2] == '.'+config.defaultDomain){
+      return request(config.docker+'/containers/'+match[1]+'/json', function(error, response, body) {
+        if(!error && response.statusCode == 200) {
+          try {
+            body = JSON.parse(body);
+            if(body.State.Running) {
+              processService(body);
+              return next();
+            } else
+              return res.status(503).send("Service  Unavailable");
+          } catch(e) {
+            req.logger.log(e);
+          }
         }
-      }
-      res.status(404).send("Page Not Found");
-    });
+        res.status(404).send("Page Not Found");
+      });
+    }
+    return res.status(404).send("Page Not Found");
   }
   next()
 }, function(req, res, next) {
-  fs.stat('/run/services/'+req.serviceName+(!req.debugUrl?'/service.sock':'/debug.sock'), function(error, stat) {
-    if(error) return res.status(500).send("Internal Server Error");
-    var headers = extend({}, req.headers);
-    delete headers.host;
-    var options = {
-      url: 'http://unix:/run/services/'+req.serviceName+(!req.debugUrl?'/service.sock:':'/debug.sock:')+req.url,
-      method: req.method,
-      headers: headers
-    };
-    if(["POST", "PUT", "PATCH"].indexOf(req.method) !== -1) {
-      options.body = req.body||'';
+  if(!hosts[req.hostName]) return res.status(500).send("Internal Server Error");
+  var service = hosts[req.hostName];
+  var options = {
+    url: 'http://'+service.ip+':'+(req.explicitPort||service.port)+req.url,
+    method: req.method,
+    headers: req.headers
+  };
+  if(["POST", "PUT", "PATCH"].indexOf(req.method) !== -1) {
+    options.body = req.body||'';
+  }
+  request(options, function(error, response, body) {
+    if(error) {
+      req.logger.log(error);
+      return res.status(500).send(error);
     }
-    request(options, function(error, response, body) {
-      if(error) {
-        req.logger.log(error);
-        return res.status(500).send(error);
-      }
-      res.set(response.headers);
-      res.status(response.statusCode).send(body);
-    });
+    res.set(response.headers);
+    res.status(response.statusCode).send(body);
   });
 });
 
