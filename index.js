@@ -1,13 +1,17 @@
-var express=require('express'),
-    exec = require('child_process').exec,
-    app = express(),
+var http = require('http'),
+    httpProxy = require('http-proxy'),
+    /*express=require('express'),
+    app = express(),*/
     request = require('request'),
     url = require('url'),
-    fs = require('fs'),
-    bodyParser = require('body-parser'),
+    //bodyParser = require('body-parser'),
     config = require('./config'),
     async = require('async'),
     extend = require('extend');
+
+var proxy = httpProxy.createProxyServer({});
+var services = {};
+var hosts = {};
 
 var logger = function(req, res, next){
   config = require('./config');
@@ -19,10 +23,9 @@ var logger = function(req, res, next){
       }
     }
   }
-  next();
+  next && next();
 };
-var services = {};
-var hosts = {};
+
 var processService = function(service) {
   var name = service.Name.substr(0, 1) == '/'?service.Name.substr(1):service.Name;
   services[name] = services[name]||{};
@@ -61,9 +64,8 @@ var processService = function(service) {
       }
     }
   }
-
-
 }
+
 var fillServices = function() {
   //docker ps --format "{{.Names}}" -f "name=ci-jenk"|grep -w ci-jenk|wc -l
     request(config.docker+'/containers/json', function(error, response, body) {
@@ -91,27 +93,102 @@ var fillServices = function() {
       }
     });
 }
+
 fillServices();
 setInterval(fillServices, 10000);
 
-app.use(bodyParser.raw({limit: '50mb', type: '*/*'}));
-app.use(logger);
-/*app.use(bodyParser.json({limit: '50mb'}));
-app.use(bodyParser.urlencoded({limit: '50mb'}));*/
+//app.use(bodyParser.raw({limit: '50mb', type: '*/*'}));
+//app.use(logger);
 
 
-app.use(function(req, res, next) {
+/*app.use(function(req, res, next) {
   if(req.body) {
     req.logger.log('Body: %o',req.body);
   } else {
     req.logger.log('');
   }
   next();
+});*/
+
+var pickServer = function(req, cb) {
+  async.auto({
+    srv: function (cb) {
+      var match;
+      explicitPort = false;
+      if(!(match = req.headers.host.match(/^([^.]+)(.*)$/))) return res.status(404).send("Page Not Found");
+      var portMatch;
+      if(portMatch = match[1].match(/^(\w+)__(\d+)__$/)) {
+        explicitPort = portMatch[2];
+        match[1] = portMatch[1];
+      }
+      cb(null, {name: match[1], domain: match[2], explicitPort: explicitPort});
+    },
+    search: ['srv', function(auto, cb) {
+      if(!hosts[auto.srv.name+auto.srv.domain]) {
+        if(auto.srv.domain == '.'+config.defaultDomain) {
+          return request(config.docker+'/containers/'+auto.srv.name+'/json', function(error, response, body) {
+            if(!error && response.statusCode == 200) {
+              try {
+                body = JSON.parse(body);
+                if(body.State.Running) {
+                  processService(body);
+                  return cb(null, hosts[auto.srv.name+auto.srv.domain]);
+                } else {
+                  return cb({status: 503, msg: "Service  Unavailable"});
+                }
+              } catch(e) {
+                req.logger.log(e);
+              }
+            }
+            cb({status: 404, msg: "Page Not Found"});
+          });
+        }
+        return cb({status: 404, msg: "Page Not Found"});
+      }
+      cb(null, hosts[auto.srv.name+auto.srv.domain])
+    }]
+  }, function(err, auto) {
+    if(!err && !auto.search) {
+      req.logger.log("No se pudo encontrar el servicio "+auto.srv.name+auto.srv.domain);
+      err = {status: 500, msg: "Internal Server Error"};
+    }
+
+    cb(err, !err && {target: 'http://'+auto.search.ip+':'+(auto.srv.explicitPort||auto.search.port)});
+  });
+}
+
+
+var app = http.createServer(function(req, res) {
+  logger(req, res);
+  //req.logger.log("recibiendo pedido");
+  pickServer(req, function(err, options) {
+    if(err) {
+      res.statusCode = err.status||500;
+      res.statusMessage = err.msg||err;
+      return res.end();
+    }
+    proxy.web(req, res, options);
+  });
 });
 
-app.use(function(req, res, next) {
+app.on('upgrade', function(req, socket, head) {
+  logger(req);
+  req.logger.log("mejorando la conexion");
+  pickServer(req, function(err, options) {
+    if(err) {
+        req.logger.log('%j', err);
+        return socket.destroy();
+    }
+    proxy.ws(req, socket, head, options);
+  });
+});
+
+proxy.on('error', function(err, req, res) {
+  req.logger.log(err);
+})
+//app.use(function(req, res, next) {
   //var hostname = url.parse(req.headers.host).hostname;
-  var match;
+  /*var match;
   req.explicitPort = false;
   if(!(match = req.headers.host.match(/^([^.]+)(.*)$/))) return res.status(404).send("Page Not Found");
   var portMatch;
@@ -120,8 +197,8 @@ app.use(function(req, res, next) {
     match[1] = portMatch[1];
   }
   req.hostName = match[1]+match[2];
-  req.logger.log('Service Name: '+ req.serviceName);
-  if(!hosts[req.hostName]) {
+  req.logger.log('Service Name: '+ req.serviceName);*///////
+  /*if(!hosts[req.hostName]) {
     if(match[2] == '.'+config.defaultDomain){
       return request(config.docker+'/containers/'+match[1]+'/json', function(error, response, body) {
         if(!error && response.statusCode == 200) {
@@ -141,9 +218,9 @@ app.use(function(req, res, next) {
     }
     return res.status(404).send("Page Not Found");
   }
-  next()
-}, function(req, res, next) {
-  if(!hosts[req.hostName]) return res.status(500).send("Internal Server Error");
+  next()*/
+//}, function(req, res, next) {
+  /*if(!hosts[req.hostName]) return res.status(500).send("Internal Server Error");
   var service = hosts[req.hostName];
   var options = {
     url: 'http://'+service.ip+':'+(req.explicitPort||service.port)+req.url,
@@ -160,7 +237,7 @@ app.use(function(req, res, next) {
     }
     res.set(response.headers);
     res.status(response.statusCode).send(body);
-  });
-});
+  });*/
+//});
 
 app.listen(80);
