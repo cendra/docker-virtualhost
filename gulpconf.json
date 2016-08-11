@@ -1,0 +1,20 @@
+{
+  "docker": {
+    "socketPath": "/var/run/docker.sock"
+  },
+  "volumes": {
+    "/var/run/docker.sock": {},
+    "/opt/project/config/index.json": {}
+  },
+  "binds": [
+    "/var/run/docker.sock:/var/run/docker.sock",
+    "/etc/nodejs-config/virtualhost.json:/opt/project/config/index.json"
+  ],
+  "links": [],
+  "ports": {
+    "80/tcp": {}
+  },
+  "pbinds": {
+    "80/tcp": [{ "HostPort": "80" }]
+  }
+}

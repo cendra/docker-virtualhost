@@ -1,9 +1,4 @@
-FROM ubuntu
-
-RUN apt-get update
-RUN apt-get install -y curl
-RUN curl -sL https://deb.nodesource.com/setup_5.x | bash -
-RUN apt-get install -y nodejs
+FROM hub.psi.unc.edu.ar/base/nodejs:6.2.2
 
 RUN mkdir -p /opt/project
 WORKDIR /opt/project

@@ -161,6 +161,9 @@ var pickServer = function(req, cb) {
 var app = http.createServer(function(req, res) {
   logger(req, res);
   //req.logger.log("recibiendo pedido");
+  if(config.debug) {
+    req.logger.log(req.method+' '+req.url);
+  }
   pickServer(req, function(err, options) {
     if(err) {
       res.statusCode = err.status||500;
