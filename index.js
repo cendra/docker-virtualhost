@@ -68,14 +68,26 @@ var processService = function(service) {
 
 var fillServices = function() {
   //docker ps --format "{{.Names}}" -f "name=ci-jenk"|grep -w ci-jenk|wc -l
-    request(config.docker+'/containers/json', function(error, response, body) {
+    var ops = {
+      uri: config.docker+'/containers/json',
+      headers: {
+        host: 'localhost:80'
+      }
+    };
+    request(ops, function(error, response, body) {
       services = extend(true, {}, config.services||{});
       var hosts = {};
       if(!error && response.statusCode == 200) {
         try {
           body = JSON.parse(body);
           async.each(body, function(service, cb) {
-            request(config.docker+'/containers/'+service.Id+'/json', function(error, response, body) {
+            var ops = {
+              uri: config.docker+'/containers/'+service.Id+'/json',
+              headers: {
+                host: 'localhost:80'
+              }
+            };
+            request(ops, function(error, response, body) {
               try {
                 body = JSON.parse(body);
                 processService(body);
