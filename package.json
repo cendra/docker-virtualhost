@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "dockerode": "^2.3.0",
+    "gulp": "^3.9.1",
     "gulp-gitignore": "^0.1.0",
     "gulp-tar": "^1.9.0",
     "vinyl-fs": "^2.4.3"
