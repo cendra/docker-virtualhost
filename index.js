@@ -16,50 +16,81 @@ const redisService = process.argv[2];
 
 
 function getRedis() {
-  return new Promise(function(resolve, reject) {
-    request.get('/networks?name=virtualhost', function(error, response, headers) {
-      if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
+  return new Promise((resolve, reject) => {
+    request.get('/networks?name=vh-backend', function(error, response, headers) {
+      if(headers.statusCode >= 400) return reject('Could not get vh-backend network');
       var netId = response.body.Id;
       request.get('/services?name='+(redisService||'redis'), function(error, response, headers) {
         if(headers.statusCode >= 400) return reject('Could not get redis service');
         var redisIp = response.body[0].Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID == netId)[0].Addr;
         var client = redis.createClient(redisIp);
-        var errored = false;
-        client.on('error', function(error) {
-          if(!errored) {
-            errored = true;
-            reject(error);
-          }
-        });
-        client.on('ready', function() {
-          client.set('netId', netId, function() {
-            resolve(client);
-          });
-        });
+        var sub = redis.createClient(redisIp);
+        resolve({client: client, sub: sub});
       });
     });
   });
 }
 
 if(cluster.isMaster) {
+  var isSwarmManager = false;
   console.log('forking master');
   getRedis()
-  .then(function(redis) {
-    redis.get('netId', function(err, netId) {
-      request.get('/services', function(error, response, headers) {
-        if(headers.statusCode >= 400) return reject('Could not get services');
-        var services = response.body
-          .filter((service)=>!['virtualhost', redisService||'redis'].includes(service.Spec.Name))
-          .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
-        services.forEach(function(service) {
-          service.Spec.Labels.vhname.split(',').forEach((vhname)=> {
-            redis.set(vhname, service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId)[0].Addr.split('/')[0]);
-            redis.incr(vhname+':count');
+  .then((redis) => {
+    new Promise((resolve, reject)=>{
+      request.get('/networks?name=virtualhost', (error, response, headers) => {
+        if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
+        resolve(response.body.Id);
+      });
+    })
+    .then((netId)=>{
+      return new Promise((resolve, reject)=>{
+        request.get('/services', (error, response, headers) => {
+          if(headers.statusCode >= 400) return reject('Could not get services');
+          isSwarmManager = true;
+          var services = response.body
+            .filter((service)=>!['virtualhost', redisService||'redis'].includes(service.Spec.Name))
+            .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
+          services.forEach((service) => {
+            var serviceIp = service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId)[0].Addr.split('/')[0];
+            var keys = [];
+            var ports = {all: 80};
+            try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
+            var processNames = function(vhname) {
+              if(!vhname) return;
+              oneProcessed = true;
+              if(!vhname.includes('//')) vhname='//'+vhname;
+              let vurl = url.parse(vhname);
+              var key = vurl.hostname+(vurl.pathname||'');
+              if(/\/$/.test(key)) key = key.slice(0,-1);
+              keys.push(key);
+              if(vurl.port) ports[key] = vurl.port;
+              redis.client.sadd(services, key);
+            }
+            try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {};
+            try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {};
+            if(!oneProcessed) {
+              console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
+            }
+            keys.forEach(key => {
+              redis.client.set(key+':ip', serviceIp);
+              redis.client.set(key+':port', ports[key]||ports.all);
+            })
           });
         });
       });
+    })
+    .catch((err) => {
+      console.log(err);
     });
+
+    request.get('/events?event=connect&type=network&network=virtualhost', (err, response, headers) {
+      response.on('data', (data) => {
+        //seguir desde aca
+      })
+    });
+
   });
+
   for (let i = 0; i < numCPUs; i++) {
     cluster.fork();
   }
