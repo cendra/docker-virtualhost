@@ -33,7 +33,38 @@ function getRedis() {
 
 if(cluster.isMaster) {
   var isSwarmManager = false;
-  console.log('forking master');
+
+  var processService = (service) => {
+    var serviceIp = service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId)[0].Addr.split('/')[0];
+    var keys = [];
+    var ports = {all: 80};
+    var proto = {all: 'http'};
+    try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
+    try { ports.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
+    var processNames = function(vhname) {
+      if(!vhname) return;
+      oneProcessed = true;
+      if(!vhname.includes('//')) vhname='//'+vhname;
+      let vurl = url.parse(vhname);
+      var key = vurl.hostname+(vurl.pathname||'');
+      if(/\/$/.test(key)) key = key.slice(0,-1);
+      keys.push(key);
+      if(vurl.port) ports[key] = vurl.port;
+      if(vurl.protocol) proto[key] = vurl.protocol;
+      redis.client.sadd(services, key);
+    }
+    try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {};
+    try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {};
+    if(!oneProcessed) {
+      console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
+    }
+    keys.forEach(key => {
+      redis.client.set(key+':ip', serviceIp);
+      redis.client.set(key+':port', ports[key]||ports.all);
+      redis.client.set(key+':proto', proto[key]||proto.all);
+    });
+  };
+
   getRedis()
   .then((redis) => {
     new Promise((resolve, reject)=>{
@@ -50,32 +81,7 @@ if(cluster.isMaster) {
           var services = response.body
             .filter((service)=>!['virtualhost', redisService||'redis'].includes(service.Spec.Name))
             .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
-          services.forEach((service) => {
-            var serviceIp = service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId)[0].Addr.split('/')[0];
-            var keys = [];
-            var ports = {all: 80};
-            try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
-            var processNames = function(vhname) {
-              if(!vhname) return;
-              oneProcessed = true;
-              if(!vhname.includes('//')) vhname='//'+vhname;
-              let vurl = url.parse(vhname);
-              var key = vurl.hostname+(vurl.pathname||'');
-              if(/\/$/.test(key)) key = key.slice(0,-1);
-              keys.push(key);
-              if(vurl.port) ports[key] = vurl.port;
-              redis.client.sadd(services, key);
-            }
-            try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {};
-            try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {};
-            if(!oneProcessed) {
-              console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
-            }
-            keys.forEach(key => {
-              redis.client.set(key+':ip', serviceIp);
-              redis.client.set(key+':port', ports[key]||ports.all);
-            })
-          });
+          services.forEach();
         });
       });
     })
@@ -85,12 +91,17 @@ if(cluster.isMaster) {
 
     request.get('/events?event=connect&type=network&network=virtualhost', (err, response, headers) {
       response.on('data', (data) => {
-        //seguir desde aca
+        if(isSwarmManager) {
+          
+        } else {
+          redis.client.publish('new:virtualhost:connection', data);
+        }
       })
     });
 
   });
 
+  console.log('forking master');
   for (let i = 0; i < numCPUs; i++) {
     cluster.fork();
   }
