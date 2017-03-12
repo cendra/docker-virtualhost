@@ -141,7 +141,7 @@ if(cluster.isMaster) {
           query: {
             filters: {
               service: [name],
-              desired-state: ['running']
+              'desired-state': ['running']
             }
           }
         }),(error, response, headers)=>{
@@ -149,7 +149,7 @@ if(cluster.isMaster) {
           resolve();
         })
         .then(()=>{
-          client.smembers(name, (error, hosts) {
+          client.smembers(name, (error, hosts) => {
             hosts.forEach((host)=>{
               client.srem('services', host);
               client.del(host);
@@ -176,7 +176,7 @@ if(cluster.isMaster) {
 
   var cache = {};
 
-  var insecure = bouncy((req, res, bounce) {
+  var insecure = bouncy((req, res, bounce) => {
     var doBounce=function(service) {
       if(service.proto == 'https') {
         res.statusCode = 301;
@@ -200,7 +200,7 @@ if(cluster.isMaster) {
       }, 60 * 1000);
       return doBounce(cache[srv.key]);
     }
-    client.smembers('services', (error, services) {
+    client.smembers('services', (error, services) => {
       var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
         var ln = (req.headers.host+req.url).substr(key.length).length;
         if(!memo) return {ln: ln, key: key};
@@ -211,7 +211,7 @@ if(cluster.isMaster) {
         res.statusCode = 404;
         return res.end('Page not found');
       }
-      new Promise((resolve, reject) {
+      new Promise((resolve, reject) => {
         client.hgetall(srv.key, function(err, data) {
           if(err) return reject(err);
           resolve(data);
@@ -245,7 +245,7 @@ if(cluster.isMaster) {
           cb('Could not obtain cert files');
         }
       }
-    }, (req, res, bounce) {
+    }, (req, res, bounce) => {
       var doBounce=function(service) {
         if(service.proto != 'https') {
           res.statusCode = 301;
@@ -269,7 +269,7 @@ if(cluster.isMaster) {
         }, 60 * 1000);
         return doBounce(cache[srv.key]);
       }
-      client.smembers('services', (error, services) {
+      client.smembers('services', (error, services) => {
         var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
           var ln = (req.headers.host+req.url).substr(key.length).length;
           if(!memo) return {ln: ln, key: key};
@@ -280,7 +280,7 @@ if(cluster.isMaster) {
           res.statusCode = 404;
           return res.end('Page not found');
         }
-        new Promise((resolve, reject) {
+        new Promise((resolve, reject) => {
           client.hgetall(srv.key, function(err, data) {
             if(err) return reject(err);
             resolve(data);
