@@ -19,7 +19,7 @@ const redisService = process.argv[2]||process.env.REDIS||'redis';
 const isProduction = !process.argv[3];
 const client = redis.createClient('redis://'+redisService);
 const sub = redis.createClient('redis://'+redisService);
-
+/*
 if(cluster.isMaster) {
   var isSwarmManager = false;
   var processService = (service) => {
@@ -176,7 +176,7 @@ if(cluster.isMaster) {
   cluster.on('exit', (worker, code, signal) => {
     console.log(`worker ${worker.process.pid} died`);
   });
-} else {
+} else {*/
 
   var cache = {};
 
@@ -300,4 +300,4 @@ if(cluster.isMaster) {
     });
     secure.listen(443);
   }
-}
+//}
