@@ -1,104 +1,167 @@
 const http = require('http'),
-    httpProxy = require('http-proxy'),
+    //httpProxy = require('http-proxy'),
+    bouncy = require('bouncy'),
     /*express=require('express'),
     app = express(),*/
     request = require('request').defaults({json: true, baseUrl:'http://unix:/var/run/docker.sock:'}),
     url = require('url'),
     //bodyParser = require('body-parser'),
     //config = require('./config'),
-    async = require('async'),
-    extend = require('extend'),
+    //async = require('async'),
+    //extend = require('extend'),
     cluster = require('cluster'),
     numCPUs = require('os').cpus().length,
-    redis = require("redis");
+    redis = require('redis'),
+    fs = require('fs'),
+    path = require('path');
 
 const redisService = process.argv[2];
-
-
-function getRedis() {
-  return new Promise((resolve, reject) => {
-    request.get('/networks?name=vh-backend', function(error, response, headers) {
-      if(headers.statusCode >= 400) return reject('Could not get vh-backend network');
-      var netId = response.body.Id;
-      request.get('/services?name='+(redisService||'redis'), function(error, response, headers) {
-        if(headers.statusCode >= 400) return reject('Could not get redis service');
-        var redisIp = response.body[0].Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID == netId)[0].Addr;
-        var client = redis.createClient(redisIp);
-        var sub = redis.createClient(redisIp);
-        resolve({client: client, sub: sub});
-      });
-    });
-  });
-}
+const isProduction = !process.argv[3];
+const client = redis.createClient(redisService||'redis');
+const sub = redis.createClient(redisService||'redis');
 
 if(cluster.isMaster) {
   var isSwarmManager = false;
-
   var processService = (service) => {
-    var serviceIp = service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId)[0].Addr.split('/')[0];
+    var dnsName = service.Spec.Name;
     var keys = [];
     var ports = {all: 80};
     var proto = {all: 'http'};
     try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
-    try { ports.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
+    try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
     var processNames = function(vhname) {
       if(!vhname) return;
       oneProcessed = true;
       if(!vhname.includes('//')) vhname='//'+vhname;
       let vurl = url.parse(vhname);
+      if(/\/$/.test(vurl.pathname)) vurl.pathname = vurl.pathname.slice(0,-1);
       var key = vurl.hostname+(vurl.pathname||'');
-      if(/\/$/.test(key)) key = key.slice(0,-1);
-      keys.push(key);
+      keys.push({key: key, path: vurl.pathname||''});
       if(vurl.port) ports[key] = vurl.port;
       if(vurl.protocol) proto[key] = vurl.protocol;
-      redis.client.sadd(services, key);
-    }
+      client.sadd(dnsName, key);
+      client.sadd('services', key);
+    };
     try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {};
     try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {};
     if(!oneProcessed) {
       console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
     }
-    keys.forEach(key => {
-      redis.client.set(key+':ip', serviceIp);
-      redis.client.set(key+':port', ports[key]||ports.all);
-      redis.client.set(key+':proto', proto[key]||proto.all);
+    keys.forEach(keyObj => {
+      client.hmset(keyObj.key, {dns: dnsName, port: ports[key]||ports.all, proto: proto[key]||proto.all, path: keyObj.path});
     });
   };
 
-  getRedis()
-  .then((redis) => {
-    new Promise((resolve, reject)=>{
-      request.get('/networks?name=virtualhost', (error, response, headers) => {
-        if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
-        resolve(response.body.Id);
+  new Promise((resolve, reject)=>{
+    request.get('/networks/virtualhost', (error, response, headers) => {
+      if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
+      resolve(response.body.Id);
+    });
+  })
+  .then((netId)=>{
+    return new Promise((resolve, reject)=>{
+      request.get('/services', (error, response, headers) => {
+        if(headers.statusCode >= 400) return reject('Could not get services');
+        isSwarmManager = true;
+        var services = response.body
+          .filter((service)=>!['virtualhost', redisService||'redis'].includes(service.Spec.Name))
+          .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
+        services.forEach(processService);
       });
-    })
-    .then((netId)=>{
-      return new Promise((resolve, reject)=>{
-        request.get('/services', (error, response, headers) => {
-          if(headers.statusCode >= 400) return reject('Could not get services');
-          isSwarmManager = true;
-          var services = response.body
-            .filter((service)=>!['virtualhost', redisService||'redis'].includes(service.Spec.Name))
-            .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
-          services.forEach();
+    });
+  })
+  .catch((err) => {
+    console.log(err);
+  });
+
+  request.get(
+    url.format({
+      pathname: '/events',
+      query: {
+        filters: {
+          event: ['start', 'unpause'],
+          type: ['container']
+        }
+      }
+    }), (err, response, headers) => {
+    response.on('data', (data) => {
+      client.publish('add:virtualhost:connection', data);
+    });
+  });
+
+  request.get(
+    url.format({
+      pathname: '/events',
+      query: {
+        filters: {
+          event: ['destroy', 'die', 'stop', 'pause'],
+          type: ['container']
+        }
+      }
+    }), (err, response, headers) => {
+    response.on('data', (data) => {
+      client.publish('rm:virtualhost:connection', data);
+    });
+  });
+
+  sub.subscribe('add:virtualhost:connection', function(data) {
+    if(isSwarmManager) {
+      new Promise((resolve, reject)=>{
+        request.get('/networks/virtualhost', (error, response, headers) => {
+          if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
+          resolve(response.body.Id);
+        });
+      })
+      .then((netId)=>{
+        return new Promise((resolve, reject)=>{
+          request.get('/services/'+data.Actor.Attributes['com.docker.swarm.service.name'], (error, response, headers)=>{
+            if(headers.statusCode >= 400) return reject(error);
+            var service = response.body;
+            if(!['virtualhost', redisService||'redis'].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
+              processService(service);
+            } else {
+              console.log('Service not suitable for virtualhost');
+            }
+          });
         });
       });
-    })
-    .catch((err) => {
-      console.log(err);
-    });
+    } else {
+      sub.unsubscribe('add:virtualhost:connection');
+      sub.unsubscribe('rm:virtualhost:connection');
+    }
+  });
 
-    request.get('/events?event=connect&type=network&network=virtualhost', (err, response, headers) {
-      response.on('data', (data) => {
-        if(isSwarmManager) {
-          
-        } else {
-          redis.client.publish('new:virtualhost:connection', data);
-        }
-      })
-    });
-
+  sub.subscribe('rm:virtualhost:connection', function(data) {
+    if(isSwarmManager) {
+      var name = data.Actor.Attributes['com.docker.swarm.service.name'];
+      //Modificar todo lo comentado
+      new Promise((resolve, reject)=>{
+        request.get(url.format({
+          pathname: '/tasks',
+          query: {
+            filters: {
+              service: [name],
+              desired-state: ['running']
+            }
+          }
+        }),(error, response, headers)=>{
+          if(response.body.length) return reject('There are still containers running for service');
+          resolve();
+        })
+        .then(()=>{
+          client.smembers(name, (error, hosts) {
+            hosts.forEach((host)=>{
+              client.srem('services', host);
+              client.del(host);
+            });
+            client.del(name);
+          });
+        });
+      });
+    } else {
+      sub.unsubscribe('add:virtualhost:connection');
+      sub.unsubscribe('rm:virtualhost:connection');
+    }
   });
 
   console.log('forking master');
@@ -110,198 +173,127 @@ if(cluster.isMaster) {
     console.log(`worker ${worker.process.pid} died`);
   });
 } else {
-  var proxy = httpProxy.createProxyServer({});
-  var services = {};
-  var hosts = {};
 
-  var logger = function(req, res, next){
-    var config = require('./config');
-    req.logger = {
-      log: function() {
-        if(config.log) {
-            arguments[0] = req.headers.host+' '+req.method+' '+req.url+'::'+arguments[0];
-            console.log.apply(console, arguments);
-        }
-      }
-    }
-    next && next();
-  };
+  var cache = {};
 
-  var processService = function(service) {
-    var name = service.Name.substr(0, 1) == '/'?service.Name.substr(1):service.Name;
-    services[name] = services[name]||{};
-    if(!services[name].ip) services[name].ip = service.NetworkSettings.IPAddress;
-    if(!services[name].hostname) services[name].hostname = [name+'.'+config.defaultDomain];
-    services[name].hostname.forEach(function(host) {
-      hosts[host] = services[name];
-    });
-    if(!services[name].port) {
-      var ports = [];
-      for(var i in service.Config.ExposedPorts) {
-        if(!service.NetworkSettings.Ports[i] && i.substr(-4) == '/tcp') {
-          var port = parseInt(i.substr(0, i.length-4), 10);
-          if(!ports.length) {
-            ports.push(port);
-            continue;
-          }
-          if(ports[0] > port) {
-            ports.unshift(port);
-          } else {
-            ports.push(port);
-          }
-        }
-      }
-      if(ports.length) {
-        if (ports.indexOf(80)!==-1) {
-          services[name].port = 80;
-        } else if (ports.indexOf(443)!==-1) {
-          services[name].port = 443;
-        } else if (ports.indexOf(8080)!==-1) {
-          services[name].port = 8080;
-        } else if (ports.indexOf(8443)!==-1) {
-          services[name].port = 8443;
-        } else {
-          services[name].port = ports[0];
-        }
-      }
-    }
-  }
-
-  var fillServices = function() {
-    //docker ps --format "{{.Names}}" -f "name=ci-jenk"|grep -w ci-jenk|wc -l
-      var ops = {
-        uri: config.docker+'/containers/json',
-        headers: {
-          host: 'localhost:80'
-        }
-      };
-      request(ops, function(error, response, body) {
-        services = extend(true, {}, config.services||{});
-        var hosts = {};
-        if(!error && response.statusCode == 200) {
-          try {
-            body = JSON.parse(body);
-            async.each(body, function(service, cb) {
-              var ops = {
-                uri: config.docker+'/containers/'+service.Id+'/json',
-                headers: {
-                  host: 'localhost:80'
-                }
-              };
-              request(ops, function(error, response, body) {
-                try {
-                  body = JSON.parse(body);
-                  processService(body);
-                } catch(e) {
-                  console.log(e);
-                }
-                cb();
-              });
-            });
-          } catch(e) {
-            console.log(e);
-          }
-        } else {
-          console.log(error||body);
-        }
-      });
-  }
-
-  fillServices();
-  setInterval(fillServices, 10000);
-
-  //app.use(bodyParser.raw({limit: '50mb', type: '*/*'}));
-  //app.use(logger);
-
-
-  /*app.use(function(req, res, next) {
-    if(req.body) {
-      req.logger.log('Body: %o',req.body);
-    } else {
-      req.logger.log('');
-    }
-    next();
-  });*/
-
-  var pickServer = function(req, cb) {
-    async.auto({
-      srv: function (cb) {
-        var match;
-        explicitPort = false;
-        if(!(match = req.headers.host.match(/^([^.]+)(.*)$/))) return res.status(404).send("Page Not Found");
-        var portMatch;
-        if(portMatch = match[1].match(/^(\w+)__(\d+)__$/)) {
-          explicitPort = portMatch[2];
-          match[1] = portMatch[1];
-        }
-        cb(null, {name: match[1], domain: match[2], explicitPort: explicitPort});
-      },
-      search: ['srv', function(auto, cb) {
-        if(!hosts[auto.srv.name+auto.srv.domain]) {
-          if(auto.srv.domain == '.'+config.defaultDomain) {
-            return request(config.docker+'/containers/'+auto.srv.name+'/json', function(error, response, body) {
-              if(!error && response.statusCode == 200) {
-                try {
-                  body = JSON.parse(body);
-                  if(body.State.Running) {
-                    processService(body);
-                    return cb(null, hosts[auto.srv.name+auto.srv.domain]);
-                  } else {
-                    return cb({status: 503, msg: "Service Unavailable"});
-                  }
-                } catch(e) {
-                  req.logger.log(e);
-                }
-              }
-              cb({status: 404, msg: "Page Not Found"});
-            });
-          }
-          return cb({status: 404, msg: "Page Not Found"});
-        }
-        cb(null, hosts[auto.srv.name+auto.srv.domain])
-      }]
-    }, function(err, auto) {
-      if(!err && !auto.search) {
-        req.logger.log("No se pudo encontrar el servicio "+auto.srv.name+auto.srv.domain);
-        err = {status: 500, msg: "Internal Server Error"};
-      }
-
-      cb(err, !err && {target: 'http://'+auto.search.ip+':'+(auto.srv.explicitPort||auto.search.port)});
-    });
-  }
-
-
-  var app = http.createServer(function(req, res) {
-    logger(req, res);
-    //req.logger.log("recibiendo pedido");
-    if(config.debug) {
-      req.logger.log('%j', req.headers);
-    }
-    pickServer(req, function(err, options) {
-      if(err) {
-        res.statusCode = err.status||500;
-        res.statusMessage = err.msg||err;
+  var insecure = bouncy((req, res, bounce) {
+    var doBounce=function(service) {
+      if(service.proto == 'https') {
+        res.statusCode = 301;
+        res.setHeader('Location', 'https://'+req.headers.host+req.url);
         return res.end();
       }
-      proxy.web(req, res, options);
-    });
-  });
-
-  app.on('upgrade', function(req, socket, head) {
-    logger(req);
-    req.logger.log("mejorando la conexion");
-    pickServer(req, function(err, options) {
-      if(err) {
-          req.logger.log('%j', err);
-          return socket.destroy();
+      bounce(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port, {
+        path: req.url.substr(service.path.length)
+      });
+    };
+    var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
+      var ln = (req.headers.host+req.url).substr(key.length).length;
+      if(!memo) return {ln: ln, key: key};
+      if(ln < memo.ln) return {ln: ln, key: key};
+      return memo;
+    }, null);
+    if(srv) {
+      if(cache[srv.key].timeout) clearTimeout(cache[srv.key].timeout);
+      cache[srv.key].timeout = setTimeout(function() {
+        delete cache[srv.key];
+      }, 60 * 1000);
+      return doBounce(cache[srv.key]);
+    }
+    client.smembers('services', (error, services) {
+      var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
+        var ln = (req.headers.host+req.url).substr(key.length).length;
+        if(!memo) return {ln: ln, key: key};
+        if(ln < memo.ln) return {ln: ln, key: key};
+        return memo;
+      }, null);
+      if(!srv) {
+        res.statusCode = 404;
+        return res.end('Page not found');
       }
-      proxy.ws(req, socket, head, options);
+      new Promise((resolve, reject) {
+        client.hgetall(srv.key, function(err, data) {
+          if(err) return reject(err);
+          resolve(data);
+        });
+      })
+      .then(data => {
+        data.timeout = setTimeout(function() {
+          delete cache[srv.key];
+        }, 60 * 1000);
+        cache[srv.key] = data;
+      });
     });
   });
+  insecure.listen(80);
 
-  proxy.on('error', function(err, req, res) {
-    req.logger.log(err);
-  })
-
-  app.listen(80);
+  var mkSecure = true;
+  try {
+    var key = fs.readFileSync(path.join('run', 'secrets', 'key'));
+    var cert = fs.readFileSync(path.join('run', 'secrets', 'cert'));
+  } catch(e) {
+    mkSecure = false;
+  }
+  if(mkSecure) {
+    var secure = bouncy({
+      SNICallback: (vhname, cb)=>{
+        try {
+          var key = fs.readFileSync(path.join('run', 'secrets', vhname+'_key'));
+          var cert = fs.readFileSync(path.join('run', 'secrets', vhname+'_cert'));
+          cb(null, tsl.createSecureContext({key: key, cert: cert}));
+        } catch(e) {
+          cb('Could not obtain cert files');
+        }
+      }
+    }, (req, res, bounce) {
+      var doBounce=function(service) {
+        if(service.proto != 'https') {
+          res.statusCode = 301;
+          res.setHeader('Location', 'http://'+req.headers.host+req.url);
+          return res.end();
+        }
+        bounce(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port, {
+          path: req.url.substr(service.path.length)
+        });
+      };
+      var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
+        var ln = (req.headers.host+req.url).substr(key.length).length;
+        if(!memo) return {ln: ln, key: key};
+        if(ln < memo.ln) return {ln: ln, key: key};
+        return memo;
+      }, null);
+      if(srv) {
+        if(cache[srv.key].timeout) clearTimeout(cache[srv.key].timeout);
+        cache[srv.key].timeout = setTimeout(function() {
+          delete cache[srv.key];
+        }, 60 * 1000);
+        return doBounce(cache[srv.key]);
+      }
+      client.smembers('services', (error, services) {
+        var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
+          var ln = (req.headers.host+req.url).substr(key.length).length;
+          if(!memo) return {ln: ln, key: key};
+          if(ln < memo.ln) return {ln: ln, key: key};
+          return memo;
+        }, null);
+        if(!srv) {
+          res.statusCode = 404;
+          return res.end('Page not found');
+        }
+        new Promise((resolve, reject) {
+          client.hgetall(srv.key, function(err, data) {
+            if(err) return reject(err);
+            resolve(data);
+          });
+        })
+        .then(data => {
+          data.timeout = setTimeout(function() {
+            delete cache[srv.key];
+          }, 60 * 1000);
+          cache[srv.key] = data;
+        });
+      });
+    });
+    secure.listen(443);
+  }
 }
