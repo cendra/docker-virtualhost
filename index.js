@@ -15,10 +15,10 @@ const http = require('http'),
     fs = require('fs'),
     path = require('path');
 
-const redisService = process.argv[2];
+const redisService = process.argv[2]||process.env.REDIS||'redis';
 const isProduction = !process.argv[3];
-const client = redis.createClient(redisService||'redis');
-const sub = redis.createClient(redisService||'redis');
+const client = redis.createClient('redis://'+redisService);
+const sub = redis.createClient('redis://'+redisService);
 
 if(cluster.isMaster) {
   var isSwarmManager = false;
@@ -64,7 +64,7 @@ if(cluster.isMaster) {
         if(headers.statusCode >= 400) return reject('Could not get services');
         isSwarmManager = true;
         var services = response.body
-          .filter((service)=>!['virtualhost', redisService||'redis'].includes(service.Spec.Name))
+          .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
           .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
         services.forEach(processService);
       });
@@ -117,7 +117,7 @@ if(cluster.isMaster) {
           request.get('/services/'+data.Actor.Attributes['com.docker.swarm.service.name'], (error, response, headers)=>{
             if(headers.statusCode >= 400) return reject(error);
             var service = response.body;
-            if(!['virtualhost', redisService||'redis'].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
+            if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
               processService(service);
             } else {
               console.log('Service not suitable for virtualhost');
