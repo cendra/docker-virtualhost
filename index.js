@@ -53,25 +53,24 @@ if(cluster.isMaster) {
   };
 
   new Promise((resolve, reject)=>{
-    request.get('/networks/virtualhost', (error, response, headers) => {
-      if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
-      resolve(response.body.Id);
+    request.get('/networks/virtualhost', (error, response, body) => {
+      if(response.statusCode >= 400) return reject('Could not get virtualhost network');
+      resolve(body.Id);
     });
   })
   .then((netId)=>{
     return new Promise((resolve, reject)=>{
-      request.get('/services', (error, response, headers) => {
-        if(headers.statusCode >= 400) return reject('Could not get services');
+      request.get('/services', (error, response, body) => {
+        if(response.statusCode >= 400) return reject('Could not get services');
         isSwarmManager = true;
-        if(Array.isArray(response.body)) {
-          var services = response.body
+        if(Array.isArray(body)) {
+          var services = body
             .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
             .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
           services.forEach(processService);
         } else {
-          console.log(response.body);
+          console.log(body);
         }
-
       });
     });
   })
@@ -88,7 +87,7 @@ if(cluster.isMaster) {
           type: ['container']
         }
       }
-    }), (err, response, headers) => {
+    }), (err, response, body) => {
     response.on('data', (data) => {
       client.publish('add:virtualhost:connection', data);
     });
@@ -103,7 +102,7 @@ if(cluster.isMaster) {
           type: ['container']
         }
       }
-    }), (err, response, headers) => {
+    }), (err, response, body) => {
     response.on('data', (data) => {
       client.publish('rm:virtualhost:connection', data);
     });
@@ -112,16 +111,16 @@ if(cluster.isMaster) {
   sub.subscribe('add:virtualhost:connection', function(data) {
     if(isSwarmManager) {
       new Promise((resolve, reject)=>{
-        request.get('/networks/virtualhost', (error, response, headers) => {
-          if(headers.statusCode >= 400) return reject('Could not get virtualhost network');
-          resolve(response.body.Id);
+        request.get('/networks/virtualhost', (error, response, body) => {
+          if(response.statusCode >= 400) return reject('Could not get virtualhost network');
+          resolve(body.Id);
         });
       })
       .then((netId)=>{
         return new Promise((resolve, reject)=>{
-          request.get('/services/'+data.Actor.Attributes['com.docker.swarm.service.name'], (error, response, headers)=>{
-            if(headers.statusCode >= 400) return reject(error);
-            var service = response.body;
+          request.get('/services/'+data.Actor.Attributes['com.docker.swarm.service.name'], (error, response, body)=>{
+            if(response.statusCode >= 400) return reject(error);
+            var service = body;
             if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
               processService(service);
             } else {
@@ -149,8 +148,8 @@ if(cluster.isMaster) {
               'desired-state': ['running']
             }
           }
-        }),(error, response, headers)=>{
-          if(response.body.length) return reject('There are still containers running for service');
+        }),(error, response, body)=>{
+          if(Array.isArray(body) && body.length) return reject('There are still containers running for service');
           resolve();
         })
         .then(()=>{
