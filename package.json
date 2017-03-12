@@ -10,11 +10,8 @@
   "author": "",
   "license": "GPL-3.0",
   "dependencies": {
-    "async": "^2.0.0-rc.4",
     "bouncy": "^3.2.2",
-    "extend": "^3.0.0",
     "hiredis": "^0.5.0",
-    "http-proxy": "^1.13.3",
     "redis": "^2.7.0",
     "request": "^2.72.0"
   },
