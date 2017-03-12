@@ -63,10 +63,15 @@ if(cluster.isMaster) {
       request.get('/services', (error, response, headers) => {
         if(headers.statusCode >= 400) return reject('Could not get services');
         isSwarmManager = true;
-        var services = response.body
-          .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
-          .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
-        services.forEach(processService);
+        if(Array.isArray(response.body)) {
+          var services = response.body
+            .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
+            .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
+          services.forEach(processService);
+        } else {
+          console.log(response.body);
+        }
+
       });
     });
   })
