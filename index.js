@@ -88,9 +88,12 @@ if(cluster.isMaster) {
         }
       }
     }), (err, response, body) => {
-    response.on('data', (data) => {
-      client.publish('add:virtualhost:connection', data);
-    });
+      if(err) console.log(err);
+      console.log('listening start container');
+      response.on('data', (data) => {
+        console.log('start data arrived '+data);
+        client.publish('add:virtualhost:connection', data);
+      });
   });
 
   request.get(
@@ -103,13 +106,17 @@ if(cluster.isMaster) {
         }
       }
     }), (err, response, body) => {
-    response.on('data', (data) => {
-      client.publish('rm:virtualhost:connection', data);
-    });
+      if(err) console.log(err);
+      console.log('listening stop container');
+      response.on('data', (data) => {
+        console.log('start data arrived '+data);
+        client.publish('rm:virtualhost:connection', data);
+      });
   });
 
   sub.subscribe('add:virtualhost:connection', function(data) {
     if(isSwarmManager) {
+      console.log('received start event');
       new Promise((resolve, reject)=>{
         request.get('/networks/virtualhost', (error, response, body) => {
           if(response.statusCode >= 400) return reject('Could not get virtualhost network');
