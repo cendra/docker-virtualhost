@@ -30,6 +30,7 @@ if(cluster.isMaster) {
     try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
     try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
     var processNames = function(vhname) {
+      console.log('Processing dns '+vhname);
       if(!vhname) return;
       oneProcessed = true;
       if(!vhname.includes('//')) vhname='//'+vhname;
@@ -53,20 +54,25 @@ if(cluster.isMaster) {
   };
 
   new Promise((resolve, reject)=>{
+    console.log('getting network');
     request.get('/networks/virtualhost', (error, response, body) => {
       if(response.statusCode >= 400) return reject('Could not get virtualhost network');
+      console.log(body);
       resolve(body.Id);
     });
   })
   .then((netId)=>{
     return new Promise((resolve, reject)=>{
+      console.log('getting services');
       request.get('/services', (error, response, body) => {
         if(response.statusCode >= 400) return reject('Could not get services');
+        console.log(body);
         isSwarmManager = true;
         if(Array.isArray(body)) {
           var services = body
             .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
             .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
+          console.log(services);
           services.forEach(processService);
         } else {
           console.log(body);
