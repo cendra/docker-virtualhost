@@ -58,7 +58,6 @@ if(cluster.isMaster) {
     console.log('getting network');
     request.get('/networks/virtualhost', (error, response, body) => {
       if(response.statusCode >= 400) return reject('Could not get virtualhost network');
-      console.log(body);
       resolve(body.Id);
     });
   })
@@ -67,7 +66,6 @@ if(cluster.isMaster) {
       console.log('getting services');
       request.get('/services', (error, response, body) => {
         if(response.statusCode >= 400) return reject('Could not get services');
-        console.log(body);
         isSwarmManager = true;
         if(Array.isArray(body)) {
           var services = body
@@ -85,16 +83,17 @@ if(cluster.isMaster) {
     console.log(err);
   });
 
-  request.get(
-    url.format({
-      pathname: '/events',
-      query: {
-        filters: {
-          event: ['start', 'unpause'],
-          type: ['container']
-        }
+  var startEventsUrl = url.format({
+    pathname: '/events',
+    query: {
+      filters: {
+        event: ['start', 'unpause'],
+        type: ['container']
       }
-    }), (err, response, body) => {
+    }
+  });
+  console.log(startEventsUrl);
+  request.get(startEventsUrl, (err, response, body) => {
       if(err) console.log(err);
       console.log('listening start container');
       response.on('data', (data) => {
@@ -103,16 +102,17 @@ if(cluster.isMaster) {
       });
   });
 
-  request.get(
-    url.format({
-      pathname: '/events',
-      query: {
-        filters: {
-          event: ['destroy', 'die', 'stop', 'pause'],
-          type: ['container']
-        }
+  var stopEventsUrl = url.format({
+    pathname: '/events',
+    query: {
+      filters: {
+        event: ['destroy', 'die', 'stop', 'pause'],
+        type: ['container']
       }
-    }), (err, response, body) => {
+    }
+  });
+  console.log(stopEventsUrl);
+  request.get(stopEventsUrl, (err, response, body) => {
       if(err) console.log(err);
       console.log('listening stop container');
       response.on('data', (data) => {
