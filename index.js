@@ -1,15 +1,9 @@
 const http = require('http'),
-    //httpProxy = require('http-proxy'),
     bouncy = require('bouncy'),
-    /*express=require('express'),
-    app = express(),*/
     Docker = require('dockerode'),
     docker = new Docker({socketPath: '/var/run/docker.sock', version: process.env.DOCKER_VERSION||'v1.26'}),
     url = require('url'),
-    //bodyParser = require('body-parser'),
-    //config = require('./config'),
-    //async = require('async'),
-    //extend = require('extend'),
+    qs = require('querystring'),
     cluster = require('cluster'),
     numCPUs = require('os').cpus().length,
     redis = require('redis'),
@@ -65,39 +59,38 @@ if(cluster.isMaster) {
   .then((netId)=>{
     return new Promise((resolve, reject)=>{
       console.log('getting services');
-      request.get('/services', (error, response, body) => {
-        if(response.statusCode >= 400) return reject('Could not get services');
+      docker.listServices((err, data) {
+        if(err) return reject('Could not get services');
         isSwarmManager = true;
-        if(Array.isArray(body)) {
-          var services = body
+        if(Array.isArray(data)) {
+          var services = data
             .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
             .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
-          console.log(services);
           services.forEach(processService);
         } else {
-          console.log(body);
+          console.log(data);
         }
-      });
+      })
     });
   })
   .catch((err) => {
     console.log(err);
   });
 
-  request.get("/events?filters={%22type%22:[%22container%22]}")
-  .on('response', (response) => {
-      console.log('listening events');
-      response.on('data', (data) => {
-        console.log('data ');
-        if(['start', 'unpause'].includes(data.status)) {
-          console.log(data);
-          client.publish('add:virtualhost:connection', data);
-        }
-        if(['destroy','die','stop','pause'].includes(data.status)) {
-          console.log(data);
-          client.publish('rm:virtualhost:connection', data);
-        }
-      });
+
+  docker.getEvents({opts: {filters: qs.escape({"type":["container"]})}}, (err, response) {
+    console.log('listening events');
+    response.on('data', (data) => {
+      console.log('data ');
+      if(['start', 'unpause'].includes(data.status)) {
+        console.log(data);
+        client.publish('add:virtualhost:connection', data);
+      }
+      if(['destroy','die','stop','pause'].includes(data.status)) {
+        console.log(data);
+        client.publish('rm:virtualhost:connection', data);
+      }
+    });
   });
 
 /*  request.get("/events?filters={event:['destroy','die','stop','pause'],type:['container']}", (err, response, body) => {
@@ -113,9 +106,9 @@ if(cluster.isMaster) {
     if(isSwarmManager) {
       console.log('received start event');
       new Promise((resolve, reject)=>{
-        request.get('/networks/virtualhost', (error, response, body) => {
-          if(response.statusCode >= 400) return reject('Could not get virtualhost network');
-          resolve(body.Id);
+        docker.getNetwork('virtualhost').inspect((err, data) => {
+          if(err) return reject('Could not get virtualhost network');
+          resolve(data.Id);
         });
       })
       .then((netId)=>{
