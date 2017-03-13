@@ -30,6 +30,7 @@ if(cluster.isMaster) {
     try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
     try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
     var processNames = function(vhname) {
+      if(!vhname) return;
       console.log('Processing dns '+vhname);
       if(!vhname) return;
       oneProcessed = true;
@@ -196,6 +197,7 @@ if(cluster.isMaster) {
   var cache = {};
 
   var insecure = bouncy((req, res, bounce) => {
+    console.log(req.method+' '+req.headers.host+req.url);
     var doBounce=function(service) {
       if(service.proto == 'https') {
         res.statusCode = 301;
