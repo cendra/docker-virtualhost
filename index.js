@@ -243,6 +243,7 @@ if(cluster.isMaster) {
           delete cache[srv.key];
         }, 60 * 1000);
         cache[srv.key] = data;
+        doBounce(cache[srv.key]);
       });
     });
   });
@@ -312,6 +313,7 @@ if(cluster.isMaster) {
             delete cache[srv.key];
           }, 60 * 1000);
           cache[srv.key] = data;
+          doBounce(cache[srv.key]);
         });
       });
     });
