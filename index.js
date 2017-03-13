@@ -93,13 +93,6 @@ if(cluster.isMaster) {
       });
   });
 
-  var stopEventsUrl = url.format({
-    pathname: ,
-    query: {
-
-    }
-  });
-  console.log(stopEventsUrl);
   request.get("/events?filters={event:['destroy','die','stop','pause'],type:['container']}", (err, response, body) => {
       if(err) console.log(err);
       console.log('listening stop container');
