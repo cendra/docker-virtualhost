@@ -87,6 +87,7 @@ if(cluster.isMaster) {
   .on('response', (response) => {
       console.log('listening events');
       response.on('data', (data) => {
+        console.log('data ');
         if(['start', 'unpause'].includes(data.status)) {
           console.log(data);
           client.publish('add:virtualhost:connection', data);
