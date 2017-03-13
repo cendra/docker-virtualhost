@@ -83,24 +83,30 @@ if(cluster.isMaster) {
     console.log(err);
   });
 
-  request.get("/events?filters={event:['start','unpause'],type:['container']}", (err, response, body) => {
+  request.get("/events?filters={%22type%22:[%22container%22]}", (err, response, body) => {
       if(err) console.log(err);
-      console.log('listening start container');
+      console.log('listening events');
       console.log(body);
       response.on('data', (data) => {
-        console.log('start data arrived '+data);
-        client.publish('add:virtualhost:connection', data);
+        if(['start', 'unpause'].includes(data.status)) {
+          console.log(data);
+          client.publish('add:virtualhost:connection', data);
+        }
+        if(['destroy','die','stop','pause'].includes(data.status)) {
+          console.log(data);
+          client.publish('rm:virtualhost:connection', data);
+        }
       });
   });
 
-  request.get("/events?filters={event:['destroy','die','stop','pause'],type:['container']}", (err, response, body) => {
+/*  request.get("/events?filters={event:['destroy','die','stop','pause'],type:['container']}", (err, response, body) => {
       if(err) console.log(err);
       console.log('listening stop container');
       response.on('data', (data) => {
         console.log('start data arrived '+data);
         client.publish('rm:virtualhost:connection', data);
       });
-  });
+  });*/
 
   sub.subscribe('add:virtualhost:connection', function(data) {
     if(isSwarmManager) {
