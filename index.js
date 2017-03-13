@@ -83,19 +83,10 @@ if(cluster.isMaster) {
     console.log(err);
   });
 
-  var startEventsUrl = url.format({
-    pathname: '/events',
-    query: {
-      filters: {
-        event: ['start', 'unpause'],
-        type: ['container']
-      }
-    }
-  });
-  console.log(startEventsUrl);
-  request.get(startEventsUrl, (err, response, body) => {
+  request.get("/events?filters={event:['start','unpause'],type:['container']}", (err, response, body) => {
       if(err) console.log(err);
       console.log('listening start container');
+      console.log(body);
       response.on('data', (data) => {
         console.log('start data arrived '+data);
         client.publish('add:virtualhost:connection', data);
@@ -103,16 +94,13 @@ if(cluster.isMaster) {
   });
 
   var stopEventsUrl = url.format({
-    pathname: '/events',
+    pathname: ,
     query: {
-      filters: {
-        event: ['destroy', 'die', 'stop', 'pause'],
-        type: ['container']
-      }
+
     }
   });
   console.log(stopEventsUrl);
-  request.get(stopEventsUrl, (err, response, body) => {
+  request.get("/events?filters={event:['destroy','die','stop','pause'],type:['container']}", (err, response, body) => {
       if(err) console.log(err);
       console.log('listening stop container');
       response.on('data', (data) => {
