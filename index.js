@@ -185,6 +185,8 @@ if(cluster.isMaster) {
   });
 } else {
 
+
+  console.log('Child process '+process.pid);
   var cache = {};
 
   var insecure = bouncy((req, res, bounce) => {
