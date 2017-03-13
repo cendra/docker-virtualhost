@@ -78,7 +78,7 @@ if(cluster.isMaster) {
   });
 
 
-  docker.getEvents({opts: {filters: qs.escape({"type":["container"]})}}, (err, response) {
+  docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) {
     console.log('listening events');
     response.on('data', (data) => {
       console.log('data ');
@@ -113,9 +113,9 @@ if(cluster.isMaster) {
       })
       .then((netId)=>{
         return new Promise((resolve, reject)=>{
-          request.get('/services/'+data.Actor.Attributes['com.docker.swarm.service.name'], (error, response, body)=>{
-            if(response.statusCode >= 400) return reject(error);
-            var service = body;
+          var service = docker.getService(data.Actor.Attributes['com.docker.swarm.service.name']);
+          service.inspect((err, service) {
+            if(err) return reject(err);
             if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
               processService(service);
             } else {
@@ -135,16 +135,11 @@ if(cluster.isMaster) {
       var name = data.Actor.Attributes['com.docker.swarm.service.name'];
       //Modificar todo lo comentado
       new Promise((resolve, reject)=>{
-        request.get(url.format({
-          pathname: '/tasks',
-          query: {
-            filters: {
-              service: [name],
-              'desired-state': ['running']
-            }
-          }
-        }),(error, response, body)=>{
-          if(Array.isArray(body) && body.length) return reject('There are still containers running for service');
+        docker.listTasks({opts: {
+          filters: qs.escape('{"service":['+name+'], "desired-state": ["running"]}')
+        }},(error, tasks)=>{
+          if(error) return reject(error);
+          if(Array.isArray(tasks) && tasks.length) return reject('There are still containers running for service');
           resolve();
         })
         .then(()=>{
