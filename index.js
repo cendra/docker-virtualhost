@@ -81,7 +81,8 @@ if(cluster.isMaster) {
   docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) => {
     console.log('listening events');
     response.on('data', (data) => {
-      console.log('data ');
+      console.log('data '+data);
+      data = JSON.parse(data);
       if(['start', 'unpause'].includes(data.status)) {
         console.log(data);
         client.publish('add:virtualhost:connection', data);
