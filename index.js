@@ -83,10 +83,9 @@ if(cluster.isMaster) {
     console.log(err);
   });
 
-  request.get("/events?filters={%22type%22:[%22container%22]}", (err, response, body) => {
-      if(err) console.log(err);
+  request.get("/events?filters={%22type%22:[%22container%22]}")
+  .on('response', (response) => {
       console.log('listening events');
-      console.log(body);
       response.on('data', (data) => {
         if(['start', 'unpause'].includes(data.status)) {
           console.log(data);
