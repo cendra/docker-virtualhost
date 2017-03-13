@@ -3,7 +3,8 @@ const http = require('http'),
     bouncy = require('bouncy'),
     /*express=require('express'),
     app = express(),*/
-    request = require('request').defaults({json: true, baseUrl:'http://unix:/var/run/docker.sock:', headers:{host: 'http'}}),
+    Docker = require('dockerode'),
+    docker = new Docker({socketPath: '/var/run/docker.sock', version: process.env.DOCKER_VERSION||'v1.26'}),
     url = require('url'),
     //bodyParser = require('body-parser'),
     //config = require('./config'),
@@ -56,9 +57,9 @@ if(cluster.isMaster) {
 
   new Promise((resolve, reject)=>{
     console.log('getting network');
-    request.get('/networks/virtualhost', (error, response, body) => {
-      if(response.statusCode >= 400) return reject('Could not get virtualhost network');
-      resolve(body.Id);
+    docker.getNetwork('virtualhost').inspect((err, data) => {
+      if(err) return reject('Could not get virtualhost network');
+      resolve(data.Id);
     });
   })
   .then((netId)=>{
