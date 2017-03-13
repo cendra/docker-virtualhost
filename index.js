@@ -59,7 +59,7 @@ if(cluster.isMaster) {
   .then((netId)=>{
     return new Promise((resolve, reject)=>{
       console.log('getting services');
-      docker.listServices((err, data) {
+      docker.listServices((err, data) => {
         if(err) return reject('Could not get services');
         isSwarmManager = true;
         if(Array.isArray(data)) {
@@ -78,7 +78,7 @@ if(cluster.isMaster) {
   });
 
 
-  docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) {
+  docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) => {
     console.log('listening events');
     response.on('data', (data) => {
       console.log('data ');
@@ -114,7 +114,7 @@ if(cluster.isMaster) {
       .then((netId)=>{
         return new Promise((resolve, reject)=>{
           var service = docker.getService(data.Actor.Attributes['com.docker.swarm.service.name']);
-          service.inspect((err, service) {
+          service.inspect((err, service) => {
             if(err) return reject(err);
             if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
               processService(service);
