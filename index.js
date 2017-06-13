@@ -1,5 +1,7 @@
 const http = require('http'),
-    bouncy = require('bouncy'),
+    https = require('https'),
+    tls = require('tls'),
+    proxy = require('http-proxy').createProxyServer({}),
     Docker = require('dockerode'),
     docker = new Docker({socketPath: '/var/run/docker.sock', version: process.env.DOCKER_VERSION||'v1.26'}),
     url = require('url'),
@@ -60,9 +62,11 @@ if(cluster.isMaster) {
     return new Promise((resolve, reject)=>{
       console.log('getting services');
       docker.listServices((err, data) => {
-        if(err) return reject('Could not get services');
-        isSwarmManager = true;
-        if(Array.isArray(data)) {
+        if(err) {
+		return reject('Could not get services');
+        }
+		isSwarmManager = true;
+	if(Array.isArray(data)) {
           var services = data
             .filter((service)=>!['virtualhost', redisService].includes(service.Spec.Name))
             .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
@@ -81,14 +85,11 @@ if(cluster.isMaster) {
   docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) => {
     console.log('listening events');
     response.on('data', (data) => {
-      console.log('data '+data);
-      data = JSON.parse(data);
-      if(['start', 'unpause'].includes(data.status)) {
-        console.log(data);
+      parsed = JSON.parse(data);
+      if(['start', 'unpause'].includes(parsed.status)) {
         client.publish('add:virtualhost:connection', data);
       }
-      if(['destroy','die','stop','pause'].includes(data.status)) {
-        console.log(data);
+      if(['stop','pause'].includes(parsed.status)) {
         client.publish('rm:virtualhost:connection', data);
       }
     });
@@ -103,9 +104,15 @@ if(cluster.isMaster) {
       });
   });*/
 
-  sub.subscribe('add:virtualhost:connection', function(data) {
+  sub.subscribe('add:virtualhost:connection');
+  sub.subscribe('rm:virtualhost:connection');
+  sub.on('message', function(channel, data) {
+    console.log('received start event %j', arguments);
     if(isSwarmManager) {
-      console.log('received start event');
+	      data = JSON.parse(data);
+        console.log('am manager!');
+        if(!data) return;
+	if(channel == 'add:virtualhost:connection') {
       new Promise((resolve, reject)=>{
         docker.getNetwork('virtualhost').inspect((err, data) => {
           if(err) return reject('Could not get virtualhost network');
@@ -125,14 +132,7 @@ if(cluster.isMaster) {
           });
         });
       });
-    } else {
-      sub.unsubscribe('add:virtualhost:connection');
-      sub.unsubscribe('rm:virtualhost:connection');
-    }
-  });
-
-  sub.subscribe('rm:virtualhost:connection', function(data) {
-    if(isSwarmManager) {
+	} else {
       var name = data.Actor.Attributes['com.docker.swarm.service.name'];
       //Modificar todo lo comentado
       new Promise((resolve, reject)=>{
@@ -153,7 +153,9 @@ if(cluster.isMaster) {
           });
         });
       });
+	}
     } else {
+    	console.log('am not manager!');
       sub.unsubscribe('add:virtualhost:connection');
       sub.unsubscribe('rm:virtualhost:connection');
     }
@@ -168,59 +170,96 @@ if(cluster.isMaster) {
     console.log(`worker ${worker.process.pid} died`);
   });
 } else {
-
-
   console.log('Child process '+process.pid);
   var cache = {};
+  var fillCache = ()=> {
+    return new Promise((resolve, reject)=>{
+      client.smembers('services', (error, services) => {
+        if(error) return reject(error);
+        resolve(services);
+      });
+    })
+    .then((services) => {
+      return Promise.all(services.map(service=>{
+        return new Promise((resolve, reject) => {
+          client.hgetall(service, function(err, data) {
+            if(err) return reject(err);
+            resolve({key: service, data: data});
+          });
+        });
+      }));
+    })
+    .then((services)=>{
+      var tmpCache = {};
+      services.forEach(service=>tmpCache[service.key]=service.data);
+      cache = tmpCache;
+    });
+  };
 
-  var insecure = bouncy((req, res, bounce) => {
+  setInterval(fillCache, 60 * 1000);
+
+  var getService = function(req) {
+    //console.log('getService');
+
+    var getCatched = () => {
+      //console.log('getCatched');
+      return new Promise((resolve, reject) => {
+        var srv = Object
+          .keys(cache)
+          .filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url))
+          .reduce((memo, key)=>{
+          var ln = (req.headers.host+req.url).substr(key.length).length;
+          if(!memo) return {ln: ln, key: key};
+          if(ln < memo.ln) return {ln: ln, key: key};
+          return memo;
+        }, null);
+
+        if(srv) {
+          //console.log('catched');
+          return resolve(cache[srv.key]);
+        }
+
+        reject();
+      });
+    };
+
+    return getCatched()
+    .catch(fillCache)
+    .then(getCatched);
+  };
+
+  var insecure = http.createServer(function(req, res) {
     console.log(req.method+' '+req.headers.host+req.url);
-    var doBounce=function(service) {
+    getService(req)
+    .then((service) => {
+      //console.log('proxy');
       if(service.proto == 'https') {
         res.statusCode = 301;
         res.setHeader('Location', 'https://'+req.headers.host+req.url);
         return res.end();
       }
-      bounce(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port, {
-        path: req.url.substr(service.path.length)
+      req.url = req.url.substr(service.path.length);
+      var port = (!isProduction&&req.headers['vh-port-override'])||service.port;
+      //console.log(service.dns+req.url);
+      proxy.web(req, res, {
+        target: 'http://'+service.dns+':'+port
+      }, function(err) {
+        if(err) console.log(err);
       });
-    };
-    var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-      var ln = (req.headers.host+req.url).substr(key.length).length;
-      if(!memo) return {ln: ln, key: key};
-      if(ln < memo.ln) return {ln: ln, key: key};
-      return memo;
-    }, null);
-    if(srv) {
-      if(cache[srv.key].timeout) clearTimeout(cache[srv.key].timeout);
-      cache[srv.key].timeout = setTimeout(function() {
-        delete cache[srv.key];
-      }, 60 * 1000);
-      return doBounce(cache[srv.key]);
-    }
-    client.smembers('services', (error, services) => {
-      var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-        var ln = (req.headers.host+req.url).substr(key.length).length;
-        if(!memo) return {ln: ln, key: key};
-        if(ln < memo.ln) return {ln: ln, key: key};
-        return memo;
-      }, null);
-      if(!srv) {
-        res.statusCode = 404;
-        return res.end('Page not found');
-      }
-      new Promise((resolve, reject) => {
-        client.hgetall(srv.key, function(err, data) {
-          if(err) return reject(err);
-          resolve(data);
-        });
-      })
-      .then(data => {
-        data.timeout = setTimeout(function() {
-          delete cache[srv.key];
-        }, 60 * 1000);
-        cache[srv.key] = data;
-        doBounce(cache[srv.key]);
+    })
+    .catch((error)=>{
+      console.log(error);
+      res.statusCode = error.statusCode;
+      res.end(error.msg);
+    });
+  });
+  insecure.on('upgrade', function (req, socket, head) {
+    getService(req)
+    .then((service) => {
+      req.url = req.url.substr(service.path.length);
+      var port = (!isProduction&&req.headers['vh-port-override'])||service.port;
+      proxy.ws(req, socket, head, {
+        target: 'http://'+service.dns+':'+port
       });
     });
   });
@@ -234,63 +273,51 @@ if(cluster.isMaster) {
     mkSecure = false;
   }
   if(mkSecure) {
-    var secure = bouncy({
+    var secure = https.createServer({
       SNICallback: (vhname, cb)=>{
         try {
           var key = fs.readFileSync(path.join('run', 'secrets', vhname+'_key'));
           var cert = fs.readFileSync(path.join('run', 'secrets', vhname+'_cert'));
-          cb(null, tsl.createSecureContext({key: key, cert: cert}));
+          cb(null, tls.createSecureContext({key: key, cert: cert}));
         } catch(e) {
           cb('Could not obtain cert files');
         }
-      }
-    }, (req, res, bounce) => {
-      var doBounce=function(service) {
-        if(service.proto != 'https') {
+      },
+      key: key,
+      cert: cert
+    }, (req, res) => {
+      console.log(req.method+' '+req.headers.host+req.url);
+      getService(req)
+      .then((service) => {
+        if(service.proto == 'http') {
           res.statusCode = 301;
           res.setHeader('Location', 'http://'+req.headers.host+req.url);
           return res.end();
         }
-        bounce(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port, {
-          path: req.url.substr(service.path.length)
+        req.url = req.url.substr(service.path.length);
+        var port = (!isProduction&&req.headers['vh-port-override'])||service.port;
+        //console.log(service.dns+req.url);
+        proxy.web(req, res, {
+          target: 'http://'+service.dns+':'+port
+        }, function(err) {
+          if(err) console.log(err);
         });
-      };
-      var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-        var ln = (req.headers.host+req.url).substr(key.length).length;
-        if(!memo) return {ln: ln, key: key};
-        if(ln < memo.ln) return {ln: ln, key: key};
-        return memo;
-      }, null);
-      if(srv) {
-        if(cache[srv.key].timeout) clearTimeout(cache[srv.key].timeout);
-        cache[srv.key].timeout = setTimeout(function() {
-          delete cache[srv.key];
-        }, 60 * 1000);
-        return doBounce(cache[srv.key]);
-      }
-      client.smembers('services', (error, services) => {
-        var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-          var ln = (req.headers.host+req.url).substr(key.length).length;
-          if(!memo) return {ln: ln, key: key};
-          if(ln < memo.ln) return {ln: ln, key: key};
-          return memo;
-        }, null);
-        if(!srv) {
-          res.statusCode = 404;
-          return res.end('Page not found');
-        }
-        new Promise((resolve, reject) => {
-          client.hgetall(srv.key, function(err, data) {
-            if(err) return reject(err);
-            resolve(data);
-          });
-        })
-        .then(data => {
-          data.timeout = setTimeout(function() {
-            delete cache[srv.key];
-          }, 60 * 1000);
-          cache[srv.key] = data;
-          doBounce(cache[srv.key]);
+      })
+      .catch((error)=>{
+        console.log(error);
+        res.statusCode = error.statusCode;
+        res.end(error.msg);
+      });
+    });
+    secure.on('upgrade', function (req, socket, head) {
+      getService(req)
+      .then((service) => {
+        req.url = req.url.substr(service.path.length);
+        proxy.ws(req, socket, head, {
+          target: {
+            host: service.dns,
+            port: (!isProduction&&req.headers['vh-port-override'])||service.port
+          }
         });
       });
     });

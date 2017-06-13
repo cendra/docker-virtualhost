@@ -10,8 +10,8 @@
   "author": "",
   "license": "GPL-3.0",
   "dependencies": {
-    "bouncy": "^3.2.2",
     "dockerode": "^2.3.6",
+    "http-proxy": "^1.16.2",
     "redis": "^2.7.0",
     "request": "^2.72.0"
   },

@@ -1,4 +1,4 @@
-FROM hub.psi.unc.edu.ar/base/nodejs:6.2.2
+FROM node:7.8
 
 RUN mkdir -p /opt/project
 WORKDIR /opt/project
