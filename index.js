@@ -9,6 +9,8 @@ const http = require('http'),
     redis = require('redis'),
     fs = require('fs'),
     path = require('path');
+    net = require('net');
+    const Transform = require('stream').Transform;
 
 const redisService = process.argv[2]||process.env.REDIS||'redis';
 const isProduction = !process.argv[3];
@@ -25,8 +27,6 @@ if(cluster.isMaster) {
     try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
     try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
     var processNames = function(vhname) {
-      if(!vhname) return;
-      console.log('Processing dns '+vhname);
       if(!vhname) return;
       oneProcessed = true;
       if(!vhname.includes('//')) vhname='//'+vhname;
@@ -84,11 +84,9 @@ if(cluster.isMaster) {
       console.log('data '+data);
       data = JSON.parse(data);
       if(['start', 'unpause'].includes(data.status)) {
-        console.log(data);
         client.publish('add:virtualhost:connection', data);
       }
-      if(['destroy','die','stop','pause'].includes(data.status)) {
-        console.log(data);
+      if(['stop','pause'].includes(data.status)) {
         client.publish('rm:virtualhost:connection', data);
       }
     });
@@ -103,57 +101,58 @@ if(cluster.isMaster) {
       });
   });*/
 
-  sub.subscribe('add:virtualhost:connection', function(data) {
+  sub.subscribe('add:virtualhost:connection');
+  sub.subscribe('rm:virtualhost:connection');
+  sub.on('message', function(channel, data) {
+    console.log('received start event %j', arguments);
     if(isSwarmManager) {
-      console.log('received start event');
-      new Promise((resolve, reject)=>{
-        docker.getNetwork('virtualhost').inspect((err, data) => {
-          if(err) return reject('Could not get virtualhost network');
-          resolve(data.Id);
-        });
-      })
-      .then((netId)=>{
-        return new Promise((resolve, reject)=>{
-          var service = docker.getService(data.Actor.Attributes['com.docker.swarm.service.name']);
-          service.inspect((err, service) => {
-            if(err) return reject(err);
-            if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
-              processService(service);
-            } else {
-              console.log('Service not suitable for virtualhost');
-            }
+      data = JSON.parse(data);
+      console.log('am manager!');
+      if(!data) return;
+      if(channel == 'add:virtualhost:connection') {
+        new Promise((resolve, reject)=>{
+          docker.getNetwork('virtualhost').inspect((err, data) => {
+            if(err) return reject('Could not get virtualhost network');
+            resolve(data.Id);
           });
-        });
-      });
-    } else {
-      sub.unsubscribe('add:virtualhost:connection');
-      sub.unsubscribe('rm:virtualhost:connection');
-    }
-  });
-
-  sub.subscribe('rm:virtualhost:connection', function(data) {
-    if(isSwarmManager) {
-      var name = data.Actor.Attributes['com.docker.swarm.service.name'];
-      //Modificar todo lo comentado
-      new Promise((resolve, reject)=>{
-        docker.listTasks({opts: {
-          filters: qs.escape('{"service":['+name+'], "desired-state": ["running"]}')
-        }},(error, tasks)=>{
-          if(error) return reject(error);
-          if(Array.isArray(tasks) && tasks.length) return reject('There are still containers running for service');
-          resolve();
         })
-        .then(()=>{
-          client.smembers(name, (error, hosts) => {
-            hosts.forEach((host)=>{
-              client.srem('services', host);
-              client.del(host);
+        .then((netId)=>{
+          return new Promise((resolve, reject)=>{
+            var service = docker.getService(data.Actor.Attributes['com.docker.swarm.service.name']);
+            service.inspect((err, service) => {
+              if(err) return reject(err);
+              if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
+                processService(service);
+              } else {
+                console.log('Service not suitable for virtualhost');
+              }
             });
-            client.del(name);
           });
         });
-      });
+      } else {
+        var name = data.Actor.Attributes['com.docker.swarm.service.name'];
+        //Modificar todo lo comentado
+        new Promise((resolve, reject)=>{
+          docker.listTasks({opts: {
+            filters: qs.escape('{"service":['+name+'], "desired-state": ["running"]}')
+          }},(error, tasks)=>{
+            if(error) return reject(error);
+            if(Array.isArray(tasks) && tasks.length) return reject('There are still containers running for service');
+            resolve();
+          })
+          .then(()=>{
+            client.smembers(name, (error, hosts) => {
+              hosts.forEach((host)=>{
+                client.srem('services', host);
+                client.del(host);
+              });
+              client.del(name);
+            });
+          });
+        });
+      }
     } else {
+      console.log('am not manager!');
       sub.unsubscribe('add:virtualhost:connection');
       sub.unsubscribe('rm:virtualhost:connection');
     }
@@ -181,9 +180,19 @@ if(cluster.isMaster) {
         res.setHeader('Location', 'https://'+req.headers.host+req.url);
         return res.end();
       }
-      bounce(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port, {
-        path: req.url.substr(service.path.length)
+      const pathTransform = new Transform({
+        transform(chunk, encoding, callback) {
+          console.log(chunk);
+          try {
+            var req = JSON.parse(chunk);
+            req.url = req.url.substr(service.path.length);
+            callback(null, JSON.stringify(req));
+          } catch(e) {
+            callback(null, chunk);
+          }
+        }
       });
+      bounce(pathTransform.pipe(net.connect(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port)));
     };
     var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
       var ln = (req.headers.host+req.url).substr(key.length).length;
@@ -251,9 +260,19 @@ if(cluster.isMaster) {
           res.setHeader('Location', 'http://'+req.headers.host+req.url);
           return res.end();
         }
-        bounce(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port, {
-          path: req.url.substr(service.path.length)
+        const pathTransform = new Transform({
+          transform(chunk, encoding, callback) {
+            console.log(chunk);
+            try {
+              var req = JSON.parse(chunk);
+              req.url = req.url.substr(service.path.length);
+              callback(null, JSON.stringify(req));
+            } catch(e) {
+              callback(null, chunk);
+            }
+          }
         });
+        bounce(pathTransform.pipe(net.connect(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port)));
       };
       var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
         var ln = (req.headers.host+req.url).substr(key.length).length;
