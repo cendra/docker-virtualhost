@@ -1,5 +1,5 @@
 const http = require('http'),
-    bouncy = require('bouncy'),
+    https = require('https'),
     Docker = require('dockerode'),
     docker = new Docker({socketPath: '/var/run/docker.sock', version: process.env.DOCKER_VERSION||'v1.26'}),
     url = require('url'),
@@ -24,8 +24,8 @@ if(cluster.isMaster) {
     var keys = [];
     var ports = {all: 80};
     var proto = {all: 'http'};
-    try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {};
-    try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {};
+    try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {}
+    try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {}
     var processNames = function(vhname) {
       if(!vhname) return;
       oneProcessed = true;
@@ -39,8 +39,8 @@ if(cluster.isMaster) {
       client.sadd(dnsName, key);
       client.sadd('services', key);
     };
-    try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {};
-    try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {};
+    try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {}
+    try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {}
     if(!oneProcessed) {
       console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
     }
@@ -70,7 +70,7 @@ if(cluster.isMaster) {
         } else {
           console.log(data);
         }
-      })
+      });
     });
   })
   .catch((err) => {
@@ -82,24 +82,16 @@ if(cluster.isMaster) {
     console.log('listening events');
     response.on('data', (data) => {
       console.log('data '+data);
-      data = JSON.parse(data);
-      if(['start', 'unpause'].includes(data.status)) {
+      var pdata = JSON.parse(data);
+      if(['start', 'unpause'].includes(pdata.status)) {
         client.publish('add:virtualhost:connection', data);
       }
-      if(['stop','pause'].includes(data.status)) {
+      if(['stop','pause'].includes(pdata.status)) {
         client.publish('rm:virtualhost:connection', data);
       }
     });
   });
 
-/*  request.get("/events?filters={event:['destroy','die','stop','pause'],type:['container']}", (err, response, body) => {
-      if(err) console.log(err);
-      console.log('listening stop container');
-      response.on('data', (data) => {
-        console.log('start data arrived '+data);
-        client.publish('rm:virtualhost:connection', data);
-      });
-  });*/
 
   sub.subscribe('add:virtualhost:connection');
   sub.subscribe('rm:virtualhost:connection');
@@ -165,74 +157,140 @@ if(cluster.isMaster) {
 
   cluster.on('exit', (worker, code, signal) => {
     console.log(`worker ${worker.process.pid} died`);
+    var hasWorkers = false;
+    for(const i in cluster.workers) {
+      hasWorkers=true;
+      break;
+    }
+    if(!hasWorkers) process.exit('No more workers');
   });
 } else {
 
-
-  console.log('Child process '+process.pid);
-  var cache = {};
-
-  var insecure = bouncy((req, res, bounce) => {
-    console.log(req.method+' '+req.headers.host+req.url);
-    var doBounce=function(service) {
-      if(service.proto == 'https') {
-        res.statusCode = 301;
-        res.setHeader('Location', 'https://'+req.headers.host+req.url);
-        return res.end();
-      }
-      const pathTransform = new Transform({
-        transform(chunk, encoding, callback) {
-          console.log(chunk);
-          try {
-            var req = JSON.parse(chunk);
-            req.url = req.url.substr(service.path.length);
-            callback(null, JSON.stringify(req));
-          } catch(e) {
-            callback(null, chunk);
-          }
-        }
+  var retrieveServices = function() {
+    return new Promise(function(resolve, reject) {
+      client.smembers('services', (error, services) => {
+        if(error) return reject(error);
+        svkeys=services;
+        resolve(services);
       });
-      bounce(pathTransform.pipe(net.connect(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port)));
-    };
-    var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-      var ln = (req.headers.host+req.url).substr(key.length).length;
-      if(!memo) return {ln: ln, key: key};
-      if(ln < memo.ln) return {ln: ln, key: key};
-      return memo;
-    }, null);
-    if(srv) {
-      if(cache[srv.key].timeout) clearTimeout(cache[srv.key].timeout);
-      cache[srv.key].timeout = setTimeout(function() {
-        delete cache[srv.key];
-      }, 60 * 1000);
-      return doBounce(cache[srv.key]);
-    }
-    client.smembers('services', (error, services) => {
-      var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
+    });
+  };
+  setInterval(retrieveServices, 60 * 1000);
+  retrieveServices();
+
+  var searchSrv = function(req) {
+    return new Promise(function(resolve, reject) {
+      var srv = svkeys.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
         var ln = (req.headers.host+req.url).substr(key.length).length;
         if(!memo) return {ln: ln, key: key};
         if(ln < memo.ln) return {ln: ln, key: key};
         return memo;
       }, null);
-      if(!srv) {
-        res.statusCode = 404;
-        return res.end('Page not found');
-      }
-      new Promise((resolve, reject) => {
+      if(!srv) return reject();
+      resolve(srv);
+    });
+  };
+
+  var getService = function(req) {
+    return searchSrv(req)
+    .catch(retrieveServices().then(searchSrv(req)))
+    .then(function(srv) {
+      if(cache[srv.key]) return cache[srv.key];
+      return new Promise(function(resolve, reject) {
         client.hgetall(srv.key, function(err, data) {
           if(err) return reject(err);
+          cache[srv.key] = data;
+          data.timeout = setTimeout(function() {
+            delete cache[srv.key];
+          }, 60 * 1000);
           resolve(data);
         });
-      })
-      .then(data => {
-        data.timeout = setTimeout(function() {
-          delete cache[srv.key];
-        }, 60 * 1000);
-        cache[srv.key] = data;
-        doBounce(cache[srv.key]);
       });
     });
-  });
+  };
+
+  var proxyWS = function(req, extSocket, head) {
+    getService(req)
+    .then(function(service) {
+      var ops = {
+        hostname: service.dns,
+        port: (!isProduction&&req.headers['vh-port-override'])||service.port,
+        method: req.method,
+        path: req.url.substr(service.path.length),
+        headers: req.headers
+      };
+      http.request(ops)
+        .on('upgrade', function(res, proxySocket, head) {
+          console.log('got upgrade response');
+          extSocket.on('error', function() {
+            proxySocket.end();
+          });
+          extSocket.write(
+            Object.keys(res.headers).reduce(function (head, key) {
+              var value = res.headers[key];
+
+              if (!Array.isArray(value)) {
+                head.push(key + ': ' + value);
+                return head;
+              }
+
+              for (var i = 0; i < value.length; i++) {
+                head.push(key + ': ' + value[i]);
+              }
+              return head;
+            }, ['HTTP/1.1 101 Switching Protocols', 'X-Forwarded-Host: '+req.headers.host, 'X-Forwarded-Proto: '+service.proto, 'X-Forwarded-Prefix: '+service.path])
+            .join('\r\n') + '\r\n\r\n'
+          );
+          proxySocket.pipe(extSocket).pipe(proxySocket);
+        })
+        .on('error', function(error) {
+          console.log(error);
+          extSocket.end();
+        })
+        .end();
+    });
+  };
+
+  var proxyHTTP = function(secure) {
+      return function(req, res) {
+        console.log(req.method+' '+req.headers.host+req.url);
+        getService(req)
+        .then(function(service) {
+          if(service.proto != 'http'+(secure?'s':'')) {
+            res.statusCode = 301;
+            res.setHeader('Location', 'http'+(secure?'':'s')+'://'+req.headers.host+req.url);
+            return res.end();
+          }
+          req.headers['x-forwarded-host'] = req.headers.host;
+          req.headers['x-forwarded-proto'] = service.proto;
+          req.headers['x-forwarded-prefix'] = service.path;
+          req.pipe(http.request({
+            hostname: service.dns,
+            port: (!isProduction&&req.headers['vh-port-override'])||service.port,
+            method: req.method,
+            path: req.url.substr(service.path.length),
+            headers: req.headers
+          }, function(response) {
+            res.writeHead(response.statusCode, response.headers);
+            response.pipe(res);
+          })).on('error', (error) => {
+            console.log(error);
+          });
+        })
+        .catch(function(error) {
+          console.log(error);
+          res.statusCode = 404;
+          return res.end('Page not found');
+        });
+      };
+  };
+
+  console.log('Child process '+process.pid);
+  var cache = {};
+  var svkeys = [];
+
+  var insecure = http.createServer(proxyHTTP());
+  insecure.on('upgrade', proxyWS);
   insecure.listen(80);
 
   var mkSecure = true;
@@ -243,76 +301,20 @@ if(cluster.isMaster) {
     mkSecure = false;
   }
   if(mkSecure) {
-    var secure = bouncy({
+    var secure = https.createServer({
+      key: key,
+      cert: cert,
       SNICallback: (vhname, cb)=>{
         try {
-          var key = fs.readFileSync(path.join('run', 'secrets', vhname+'_key'));
-          var cert = fs.readFileSync(path.join('run', 'secrets', vhname+'_cert'));
-          cb(null, tsl.createSecureContext({key: key, cert: cert}));
+          var _key = fs.readFileSync(path.join('run', 'secrets', vhname+'_key'));
+          var _cert = fs.readFileSync(path.join('run', 'secrets', vhname+'_cert'));
+          cb(null, tsl.createSecureContext({key: _key, cert: _cert}));
         } catch(e) {
-          cb('Could not obtain cert files');
+          cb(null, tsl.createSecureContext({key: key, cert: cert}));
         }
       }
-    }, (req, res, bounce) => {
-      var doBounce=function(service) {
-        if(service.proto != 'https') {
-          res.statusCode = 301;
-          res.setHeader('Location', 'http://'+req.headers.host+req.url);
-          return res.end();
-        }
-        const pathTransform = new Transform({
-          transform(chunk, encoding, callback) {
-            console.log(chunk);
-            try {
-              var req = JSON.parse(chunk);
-              req.url = req.url.substr(service.path.length);
-              callback(null, JSON.stringify(req));
-            } catch(e) {
-              callback(null, chunk);
-            }
-          }
-        });
-        bounce(pathTransform.pipe(net.connect(service.dns, (!isProduction&&req.headers['vh-port-override'])||service.port)));
-      };
-      var srv = Object.keys(cache).filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-        var ln = (req.headers.host+req.url).substr(key.length).length;
-        if(!memo) return {ln: ln, key: key};
-        if(ln < memo.ln) return {ln: ln, key: key};
-        return memo;
-      }, null);
-      if(srv) {
-        if(cache[srv.key].timeout) clearTimeout(cache[srv.key].timeout);
-        cache[srv.key].timeout = setTimeout(function() {
-          delete cache[srv.key];
-        }, 60 * 1000);
-        return doBounce(cache[srv.key]);
-      }
-      client.smembers('services', (error, services) => {
-        var srv = services.filter(key=>new RegExp('^'+key, 'i').test(req.headers.host+req.url)).reduce((memo, key)=>{
-          var ln = (req.headers.host+req.url).substr(key.length).length;
-          if(!memo) return {ln: ln, key: key};
-          if(ln < memo.ln) return {ln: ln, key: key};
-          return memo;
-        }, null);
-        if(!srv) {
-          res.statusCode = 404;
-          return res.end('Page not found');
-        }
-        new Promise((resolve, reject) => {
-          client.hgetall(srv.key, function(err, data) {
-            if(err) return reject(err);
-            resolve(data);
-          });
-        })
-        .then(data => {
-          data.timeout = setTimeout(function() {
-            delete cache[srv.key];
-          }, 60 * 1000);
-          cache[srv.key] = data;
-          doBounce(cache[srv.key]);
-        });
-      });
-    });
+    }, proxyHTTP(true));
+    secure.on('upgrade', proxyWS);
     secure.listen(443);
   }
 }
