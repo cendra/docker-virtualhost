@@ -258,9 +258,8 @@ if(cluster.isMaster) {
       cookie = hasCookie?cookie[1]:base64id.generateId();
       if(!socket.dests) socket.dests = {};
       return new Promise((resolve, reject) => {
-        dw('retrieving dest for ('+socket._pupi+') '+service.dns);
         if(socket.dests[service.dns]) return resolve({dest: socket.dests[service.dns]});
-        if(!service.lb) {
+        if(service.lb != 'true') {
           dw('('+socket._pupi+') Creating dest without custom load balance for '+service.dns);
           socket.dests[service.dns] = net.connect({
             port: (!isProduction&&request.headers['vh-port-override'])||service.port,
@@ -269,27 +268,36 @@ if(cluster.isMaster) {
           return resolve({dest: socket.dests[service.dns], new: true});
         }
         dw('('+socket._pupi+') Creating dest with custom load balance for '+service.dns);
-        client.hgetall('vh:'+cookie+':cookie', function(err, params) {
+        var registerCookie = () => {
+          client.rpoplpush(service.dns+':addrs', service.dns+':addrs', function(err, addr) {
+            if(err) return reject(err);
+            var params = {
+              port: (!isProduction&&request.headers['vh-port-override'])||service.port,
+              host: addr
+            };
+            dw('('+socket._pupi+') registering cookie '+cookie+' for '+service.dns+' with params: %j',params);
+            socket.dests[service.dns] = net.connect(params);
+            client.hmset(service.dns+':'+cookie+':cookie', params);
+            return resolve({dest: socket.dests[service.dns], new: true});
+          });
+        };
+        client.hgetall(service.dns+':'+cookie+':cookie', function(err, params) {
           if(err) return reject(err);
           if(params) {
             dw('('+socket._pupi+') cookie '+cookie+' already registered for '+service.dns+' with params: %j',params);
-            socket.dests[service.dns] = net.connect(params);
-            return resolve({dest: socket.dests[service.dns], new: true});
-          } else {
-            client.rpoplpush(service.dns+':addrs', service.dns+':addrs', function(err, addr) {
-              if(err) return reject(err);
-              var params = {
-                port: (!isProduction&&request.headers['vh-port-override'])||service.port,
-                host: addr
-              };
-              dw('('+socket._pupi+') registering cookie '+cookie+' for '+service.dns+' with params: %j',params);
-              socket.dests[service.dns] = net.connect(params);
-              client.hmset('vh:'+cookie+':cookie', params);
-              return resolve({dest: socket.dests[service.dns], new: true});
+            client.lrange(service.dns+':addrs', 0, -1, function(err, addrs) {
+              if(err) return dw(err);
+              dw('('+socket._pupi+') Addresses found %j',addrs);
+              if(addrs.indexOf(params.host)) {
+                socket.dests[service.dns] = net.connect(params);
+                return resolve({dest: socket.dests[service.dns], new: true});
+              }
+              registerCookie();
             });
+          } else {
+            registerCookie();
           }
         });
-
       })
       .then((res) => {
         var dest = res.dest;
@@ -298,14 +306,14 @@ if(cluster.isMaster) {
           dest.on('data', (chunk) => {
             if(socket.upgraded) return;
             if(hasCookie) {
-              dt('('+socket._pupi+') '+chunk.toString());
+              dt('('+socket._pupi+')\r\n '+chunk.toString());
               socket.write(chunk);
             } else {
               vhdata += chunk.toString();
               if(vhdata.indexOf('\r\n\r\n') !== -1) {
                 var data = vhdata.split('\r\n\r\n');
                 socket.write(data[0]+'\r\nSet-Cookie: __vh='+cookie+'; Path=/; HttpOnly\r\n\r\n'+(data[1]||''));
-                dt('('+socket._pupi+') '+data[0]+'\r\nSet-Cookie: __vh='+cookie+'; HttpOnly\r\n\r\n'+(data[1]||''));
+                dt('('+socket._pupi+')\r\n '+data[0]+'\r\nSet-Cookie: __vh='+cookie+'; HttpOnly\r\n\r\n'+(data[1]||''));
                 hasCookie = true;
                 vhdata = '';
               }
@@ -358,6 +366,7 @@ if(cluster.isMaster) {
             return head;
           }, [request.method+' '+request.url.substr(service.path.length)+' HTTP/'+request.httpVersion, 'X-Forwarded-Host: '+request.headers.host, 'X-Forwarded-Proto: '+service.proto, 'X-Forwarded-Prefix: '+service.path])
           .join('\r\n') + '\r\n\r\n';
+          dt('('+request.connection._pupi+')\r\n '+payload);
           dest.write(payload);
 
           request.on('data', function(chunk) {
