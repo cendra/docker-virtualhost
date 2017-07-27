@@ -22,8 +22,10 @@ const sub = redis.createClient('redis://'+redisService);
 
 if(cluster.isMaster) {
   var isSwarmManager = false;
+  var dm = require('debug')('virtualhost:master');
   var processService = (service) => {
     var dnsName = service.Spec.Name;
+    dm('Processing service '+dnsName);
     var keys = [];
     var ports = {all: 80};
     var proto = {all: 'http'};
@@ -46,20 +48,22 @@ if(cluster.isMaster) {
     try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {}
     try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {}
     if(!oneProcessed) {
-      return console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
+      return dm('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
     }
     docker.listTasks({
       filters: '{"service":["'+dnsName+'"], "desired-state":["running"]}'
     },(error, tasks)=>{
-      console.log(dnsName+', '+doLb);
-      if(error) return console.log(error);
+      if(error) return dm(error);
       var tasksAddresses = tasks.reduce((memo,task)=>{
         return memo.concat(task.NetworksAttachments.filter(spec=>spec.Network.Spec.Name=='virtualhost').reduce((memo,network)=>memo.concat(network.Addresses.reduce((memo,address)=>memo.concat(address.split('/')[0]),[])),[]));
       },[]);
+
       keys.forEach(keyObj => {
-        client.hmset(keyObj.key, {dns: dnsName, port: ports[key]||ports.all, proto: proto[key]||proto.all, path: keyObj.path, lb: doLb});
+        var set = {dns: dnsName, port: ports[key]||ports.all, proto: proto[key]||proto.all, path: keyObj.path, lb: doLb};
+        dm(keyObj.key+' => %j',set);
+        client.hmset(keyObj.key, set);
         client.del(dnsName+':addrs',()=>{
-          console.log('Se pushea '+dnsName+':addrs => %j',tasksAddresses);
+          dm(dnsName+':addrs => %j',tasksAddresses);
           client.lpush(dnsName+':addrs',tasksAddresses);
         });
 
@@ -68,7 +72,7 @@ if(cluster.isMaster) {
   };
 
   new Promise((resolve, reject)=>{
-    console.log('getting network');
+    dm('getting network');
     docker.getNetwork('virtualhost').inspect((err, data) => {
       if(err) return reject('Could not get virtualhost network');
       resolve(data.Id);
@@ -76,7 +80,7 @@ if(cluster.isMaster) {
   })
   .then((netId)=>{
     return new Promise((resolve, reject)=>{
-      console.log('getting services');
+      dm('getting services');
       docker.listServices((err, data) => {
         if(err) return reject('Could not get services');
         isSwarmManager = true;
@@ -92,19 +96,20 @@ if(cluster.isMaster) {
     });
   })
   .catch((err) => {
-    console.log(err);
+    dm(err);
   });
 
 
   docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) => {
-    console.log('listening events');
+    dm('listening events');
     response.on('data', (data) => {
       var pdata = JSON.parse(data);
-      console.log('Event '+pdata.status);
       if(['start', 'unpause'].includes(pdata.status)) {
+        dm('Event detected '+pdata.status);
         client.publish('add:virtualhost:connection', data);
       }
       if(['stop','pause'].includes(pdata.status)) {
+        dm('Event detected '+pdata.status);
         client.publish('rm:virtualhost:connection', data);
       }
     });
@@ -115,9 +120,7 @@ if(cluster.isMaster) {
   sub.subscribe('rm:virtualhost:connection');
   sub.on('message', function(channel, data) {
     if(isSwarmManager) {
-      console.log(data);
       data = JSON.parse(data);
-      console.log('am manager!');
       if(!data) return;
       if(channel == 'add:virtualhost:connection') {
         new Promise((resolve, reject)=>{
@@ -134,11 +137,12 @@ if(cluster.isMaster) {
               if(!['virtualhost', redisService].includes(service.Spec.Name) && service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length) {
                 processService(service);
               } else {
-                console.log('Service not suitable for virtualhost');
+                reject('Service not suitable for virtualhost');
               }
             });
           });
-        });
+        })
+        .catch((error) => dm(error.message||error));
       } else {
         var name = data.Actor.Attributes['com.docker.swarm.service.name'];
         //Modificar todo lo comentado
@@ -150,7 +154,7 @@ if(cluster.isMaster) {
           });
         })
         .then(()=>{
-          console.log('Eliminando todo');
+          dm('Removing service '+name);
           client.smembers(name, (error, hosts) => {
             hosts.forEach((host)=>{
               client.srem('services', host);
@@ -161,31 +165,31 @@ if(cluster.isMaster) {
           });
         })
         .catch((error)=>{
-          console.log(error.message||error);
+          dm(error.message||error);
           docker.getTask(data.Actor.Attributes['com.docker.swarm.task.id']).inspect((error, task) => {
-            console.log(task);
-            if(error) console.log(error);
+            if(error) return dm(error);
             var taskAdrresses = task.NetworksAttachments
                                     .filter(spec=>spec.Network.Spec.Name=='virtualhost')
                                     .reduce((memo,network)=>memo.concat(network.Addresses.reduce((memo,address)=>memo.concat(address.split('/')[0]),[])),[]);
+            dm('Removing %j from '+name+':addrs',taskAdrresses);
             taskAdrresses.forEach(address=>client.lrem(name+':addrs', address));
           });
         });
       }
     } else {
-      console.log('am not manager!');
+      dm('am not manager!');
       sub.unsubscribe('add:virtualhost:connection');
       sub.unsubscribe('rm:virtualhost:connection');
     }
   });
 
-  console.log('forking master');
+  dm('forking master '+numCPUs+' times.');
   for (let i = 0; i < numCPUs; i++) {
     cluster.fork();
   }
 
   cluster.on('exit', (worker, code, signal) => {
-    console.log(`worker ${worker.process.pid} died`);
+    dm(`worker ${worker.process.pid} died`);
     var hasWorkers = false;
     for(const i in cluster.workers) {
       hasWorkers=true;
@@ -194,6 +198,9 @@ if(cluster.isMaster) {
     if(!hasWorkers) process.exit('No more workers');
   });
 } else {
+
+  var dw = require('debug')('virtualhost:worker'),
+      dt = require('debug')('virtualhost:traffic');
 
   var retrieveServices = function() {
     return new Promise(function(resolve, reject) {
@@ -251,32 +258,31 @@ if(cluster.isMaster) {
       cookie = hasCookie?cookie[1]:base64id.generateId();
       if(!socket.dests) socket.dests = {};
       return new Promise((resolve, reject) => {
-        console.log('obteniendo dest para ('+socket._pupi+') '+service.dns);
+        dw('retrieving dest for ('+socket._pupi+') '+service.dns);
         if(socket.dests[service.dns]) return resolve({dest: socket.dests[service.dns]});
         if(!service.lb) {
-          console.log('Creando dest sin lb para ('+socket._pupi+') '+service.dns);
+          dw('('+socket._pupi+') Creating dest without custom load balance for '+service.dns);
           socket.dests[service.dns] = net.connect({
             port: (!isProduction&&request.headers['vh-port-override'])||service.port,
             host: service.dns
           });
           return resolve({dest: socket.dests[service.dns], new: true});
         }
-        console.log('Creando dest con lb para ('+socket._pupi+') '+service.dns);
+        dw('('+socket._pupi+') Creating dest with custom load balance for '+service.dns);
         client.hgetall('vh:'+cookie+':cookie', function(err, params) {
           if(err) return reject(err);
           if(params) {
-            console.log('ya existía con params ('+socket._pupi+') '+service.dns+' - '+cookie+': %j',params);
+            dw('('+socket._pupi+') cookie '+cookie+' already registered for '+service.dns+' with params: %j',params);
             socket.dests[service.dns] = net.connect(params);
             return resolve({dest: socket.dests[service.dns], new: true});
           } else {
             client.rpoplpush(service.dns+':addrs', service.dns+':addrs', function(err, addr) {
-              console.log('rpoplpush '+service.dns+':addrs');
               if(err) return reject(err);
               var params = {
                 port: (!isProduction&&request.headers['vh-port-override'])||service.port,
                 host: addr
               };
-              console.log('Se crean params ('+socket._pupi+') '+service.dns+' - '+cookie+': %j',params);
+              dw('('+socket._pupi+') registering cookie '+cookie+' for '+service.dns+' with params: %j',params);
               socket.dests[service.dns] = net.connect(params);
               client.hmset('vh:'+cookie+':cookie', params);
               return resolve({dest: socket.dests[service.dns], new: true});
@@ -292,14 +298,14 @@ if(cluster.isMaster) {
           dest.on('data', (chunk) => {
             if(socket.upgraded) return;
             if(hasCookie) {
-              //console.log('1('+socket._pupi+') '+chunk.toString());
+              dt('('+socket._pupi+') '+chunk.toString());
               socket.write(chunk);
             } else {
               vhdata += chunk.toString();
               if(vhdata.indexOf('\r\n\r\n') !== -1) {
                 var data = vhdata.split('\r\n\r\n');
                 socket.write(data[0]+'\r\nSet-Cookie: __vh='+cookie+'; Path=/; HttpOnly\r\n\r\n'+(data[1]||''));
-                //console.log('2('+socket._pupi+') '+data[0]+'\r\nSet-Cookie: __vh='+cookie+'; HttpOnly\r\n\r\n'+(data[1]||''));
+                dt('('+socket._pupi+') '+data[0]+'\r\nSet-Cookie: __vh='+cookie+'; HttpOnly\r\n\r\n'+(data[1]||''));
                 hasCookie = true;
                 vhdata = '';
               }
@@ -326,8 +332,9 @@ if(cluster.isMaster) {
     };
 
     server.on('request', function(request, response) {
+      //_pupi is just an identifier for debugging purposes
       if(!request.connection._pupi) request.connection._pupi = Math.random();
-      console.log('('+request.connection._pupi+') request '+request.url);
+      dw('('+request.connection._pupi+') request '+request.url);
       getService(request)
       .then((service)=>{
         return getDest(request.connection, service, request)
@@ -360,8 +367,8 @@ if(cluster.isMaster) {
       });
     });
     server.on('upgrade', function(request, socket, head){
-      console.log('upgraded '+request.url);
       if(!socket._pupi) socket._pupi = Math.random();
+      dw('('+socket._pupi+') upgraded '+request.url);
       socket.upgraded = true;
       getService(request)
       .then((service)=>{
@@ -394,7 +401,7 @@ if(cluster.isMaster) {
     return server;
   };
 
-  console.log('Child process '+process.pid);
+  dw('Child process '+process.pid);
   var cache = {};
   var svkeys = [];
 
@@ -409,6 +416,7 @@ if(cluster.isMaster) {
     mkSecure = false;
   }
   if(mkSecure) {
+    dw('Creating secure server');
     var secure = proxy({
       key: key,
       cert: cert,

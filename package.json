@@ -12,6 +12,7 @@
   "dependencies": {
     "base64id": "^1.0.0",
     "bouncy": "^3.2.2",
+    "debug": "^2.6.8",
     "dockerode": "^2.3.6",
     "redis": "^2.7.0"
   },
