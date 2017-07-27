@@ -1,7 +1,7 @@
 {
   "name": "virtualhost",
   "version": "2.0.0",
-  "description": "Virtual Host for Docker Swarm using Bouncy as proxy",
+  "description": "Reverse HTTP Proxy for Docker Swarm inspired by Bouncy",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -10,9 +10,10 @@
   "author": "Agustín Moyano",
   "license": "GPL-3.0",
   "dependencies": {
+    "base64id": "^1.0.0",
+    "bouncy": "^3.2.2",
     "dockerode": "^2.3.6",
-    "redis": "^2.7.0",
-    "request": "^2.72.0"
+    "redis": "^2.7.0"
   },
   "devDependencies": {
     "gulp": "^3.9.1",

@@ -8,9 +8,12 @@ const http = require('http'),
     numCPUs = require('os').cpus().length,
     redis = require('redis'),
     fs = require('fs'),
-    path = require('path');
-    net = require('net');
-    const Transform = require('stream').Transform;
+    path = require('path'),
+    net = require('net'),
+    bouncy = require('bouncy'),
+    Transform = require('stream').Transform,
+    util = require('util'),
+    base64id = require('base64id');
 
 const redisService = process.argv[2]||process.env.REDIS||'redis';
 const isProduction = !process.argv[3];
@@ -24,6 +27,7 @@ if(cluster.isMaster) {
     var keys = [];
     var ports = {all: 80};
     var proto = {all: 'http'};
+    var doLb = !!(service.Spec.Labels.vhlb&&service.Spec.Labels.vhlb=='true');
     try { ports.all = service.Spec.Labels.vhport||80; } catch(e) {}
     try { proto.all = service.Spec.Labels.vhproto||'http'; } catch(e) {}
     var processNames = function(vhname) {
@@ -42,10 +46,24 @@ if(cluster.isMaster) {
     try { service.Spec.Labels.vhnames.split(',').forEach(processNames); } catch(e) {}
     try { processNames(service.Spec.TaskTemplate.ContainerSpec.Hostname); } catch(e) {}
     if(!oneProcessed) {
-      console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
+      return console.log('Could not find hostname for service '+service.Spec.Name+'. Please, try with "docker service update --label-add vhnames=<hostname1>,<hostname2>,... '+service.Spec.Name+'"');
     }
-    keys.forEach(keyObj => {
-      client.hmset(keyObj.key, {dns: dnsName, port: ports[key]||ports.all, proto: proto[key]||proto.all, path: keyObj.path});
+    docker.listTasks({
+      filters: '{"service":["'+dnsName+'"], "desired-state":["running"]}'
+    },(error, tasks)=>{
+      console.log(dnsName+', '+doLb);
+      if(error) return console.log(error);
+      var tasksAddresses = tasks.reduce((memo,task)=>{
+        return memo.concat(task.NetworksAttachments.filter(spec=>spec.Network.Spec.Name=='virtualhost').reduce((memo,network)=>memo.concat(network.Addresses.reduce((memo,address)=>memo.concat(address.split('/')[0]),[])),[]));
+      },[]);
+      keys.forEach(keyObj => {
+        client.hmset(keyObj.key, {dns: dnsName, port: ports[key]||ports.all, proto: proto[key]||proto.all, path: keyObj.path, lb: doLb});
+        client.del(dnsName+':addrs',()=>{
+          console.log('Se pushea '+dnsName+':addrs => %j',tasksAddresses);
+          client.lpush(dnsName+':addrs',tasksAddresses);
+        });
+
+      });
     });
   };
 
@@ -68,7 +86,7 @@ if(cluster.isMaster) {
             .filter((service)=>service.Endpoint.VirtualIPs.filter((vip)=>vip.NetworkID==netId).length);
           services.forEach(processService);
         } else {
-          console.log(data);
+          reject('data is not an array');
         }
       });
     });
@@ -81,8 +99,8 @@ if(cluster.isMaster) {
   docker.getEvents({opts: {filters: qs.escape('{"type":["container"]}')}}, (err, response) => {
     console.log('listening events');
     response.on('data', (data) => {
-      console.log('data '+data);
       var pdata = JSON.parse(data);
+      console.log('Event '+pdata.status);
       if(['start', 'unpause'].includes(pdata.status)) {
         client.publish('add:virtualhost:connection', data);
       }
@@ -96,8 +114,8 @@ if(cluster.isMaster) {
   sub.subscribe('add:virtualhost:connection');
   sub.subscribe('rm:virtualhost:connection');
   sub.on('message', function(channel, data) {
-    console.log('received start event %j', arguments);
     if(isSwarmManager) {
+      console.log(data);
       data = JSON.parse(data);
       console.log('am manager!');
       if(!data) return;
@@ -125,21 +143,32 @@ if(cluster.isMaster) {
         var name = data.Actor.Attributes['com.docker.swarm.service.name'];
         //Modificar todo lo comentado
         new Promise((resolve, reject)=>{
-          docker.listTasks({opts: {
-            filters: qs.escape('{"service":['+name+'], "desired-state": ["running"]}')
-          }},(error, tasks)=>{
+          docker.listTasks({filters: '{"service":["'+name+'"], "desired-state": ["running"]}'},(error, tasks)=>{
             if(error) return reject(error);
             if(Array.isArray(tasks) && tasks.length) return reject('There are still containers running for service');
             resolve();
-          })
-          .then(()=>{
-            client.smembers(name, (error, hosts) => {
-              hosts.forEach((host)=>{
-                client.srem('services', host);
-                client.del(host);
-              });
-              client.del(name);
+          });
+        })
+        .then(()=>{
+          console.log('Eliminando todo');
+          client.smembers(name, (error, hosts) => {
+            hosts.forEach((host)=>{
+              client.srem('services', host);
+              client.del(host);
+              client.del(host+':addrs');
             });
+            client.del(name);
+          });
+        })
+        .catch((error)=>{
+          console.log(error.message||error);
+          docker.getTask(data.Actor.Attributes['com.docker.swarm.task.id']).inspect((error, task) => {
+            console.log(task);
+            if(error) console.log(error);
+            var taskAdrresses = task.NetworksAttachments
+                                    .filter(spec=>spec.Network.Spec.Name=='virtualhost')
+                                    .reduce((memo,network)=>memo.concat(network.Addresses.reduce((memo,address)=>memo.concat(address.split('/')[0]),[])),[]);
+            taskAdrresses.forEach(address=>client.lrem(name+':addrs', address));
           });
         });
       }
@@ -209,88 +238,167 @@ if(cluster.isMaster) {
     });
   };
 
-  var proxyWS = function(req, extSocket, head) {
-    getService(req)
-    .then(function(service) {
-      var ops = {
-        hostname: service.dns,
-        port: (!isProduction&&req.headers['vh-port-override'])||service.port,
-        method: req.method,
-        path: req.url.substr(service.path.length),
-        headers: req.headers
-      };
-      http.request(ops)
-        .on('upgrade', function(res, proxySocket, head) {
-          console.log('got upgrade response');
-          extSocket.on('error', function() {
-            proxySocket.end();
+  var proxy = function(options) {
+    var secure = false;
+    if(options) {
+      secure = options.secure;
+      delete options.secure;
+    }
+
+    var getDest=function(socket, service, request) {
+      var cookie = parseCookie(request.headers.cookie||'');
+      var hasCookie = !!cookie;
+      cookie = hasCookie?cookie[1]:base64id.generateId();
+      if(!socket.dests) socket.dests = {};
+      return new Promise((resolve, reject) => {
+        console.log('obteniendo dest para ('+socket._pupi+') '+service.dns);
+        if(socket.dests[service.dns]) return resolve({dest: socket.dests[service.dns]});
+        if(!service.lb) {
+          console.log('Creando dest sin lb para ('+socket._pupi+') '+service.dns);
+          socket.dests[service.dns] = net.connect({
+            port: (!isProduction&&request.headers['vh-port-override'])||service.port,
+            host: service.dns
           });
-          extSocket.write(
-            Object.keys(res.headers).reduce(function (head, key) {
-              var value = res.headers[key];
-
-              if (!Array.isArray(value)) {
-                head.push(key + ': ' + value);
-                return head;
-              }
-
-              for (var i = 0; i < value.length; i++) {
-                head.push(key + ': ' + value[i]);
-              }
-              return head;
-            }, ['HTTP/1.1 101 Switching Protocols', 'X-Forwarded-Host: '+req.headers.host, 'X-Forwarded-Proto: '+service.proto, 'X-Forwarded-Prefix: '+service.path])
-            .join('\r\n') + '\r\n\r\n'
-          );
-          proxySocket.pipe(extSocket).pipe(proxySocket);
-        })
-        .on('error', function(error) {
-          console.log(error);
-          extSocket.end();
-        })
-        .end();
-    });
-  };
-
-  var proxyHTTP = function(secure) {
-      return function(req, res) {
-        console.log(req.method+' '+req.headers.host+req.url);
-        getService(req)
-        .then(function(service) {
-          if(service.proto != 'http'+(secure?'s':'')) {
-            res.statusCode = 301;
-            res.setHeader('Location', 'http'+(secure?'':'s')+'://'+req.headers.host+req.url);
-            return res.end();
+          return resolve({dest: socket.dests[service.dns], new: true});
+        }
+        console.log('Creando dest con lb para ('+socket._pupi+') '+service.dns);
+        client.hgetall('vh:'+cookie+':cookie', function(err, params) {
+          if(err) return reject(err);
+          if(params) {
+            console.log('ya existía con params ('+socket._pupi+') '+service.dns+' - '+cookie+': %j',params);
+            socket.dests[service.dns] = net.connect(params);
+            return resolve({dest: socket.dests[service.dns], new: true});
+          } else {
+            client.rpoplpush(service.dns+':addrs', service.dns+':addrs', function(err, addr) {
+              console.log('rpoplpush '+service.dns+':addrs');
+              if(err) return reject(err);
+              var params = {
+                port: (!isProduction&&request.headers['vh-port-override'])||service.port,
+                host: addr
+              };
+              console.log('Se crean params ('+socket._pupi+') '+service.dns+' - '+cookie+': %j',params);
+              socket.dests[service.dns] = net.connect(params);
+              client.hmset('vh:'+cookie+':cookie', params);
+              return resolve({dest: socket.dests[service.dns], new: true});
+            });
           }
-          req.headers['x-forwarded-host'] = req.headers.host;
-          req.headers['x-forwarded-proto'] = service.proto;
-          req.headers['x-forwarded-prefix'] = service.path;
-          req.pipe(http.request({
-            hostname: service.dns,
-            port: (!isProduction&&req.headers['vh-port-override'])||service.port,
-            method: req.method,
-            path: req.url.substr(service.path.length),
-            headers: req.headers
-          }, function(response) {
-            res.writeHead(response.statusCode, response.headers);
-            response.pipe(res);
-          })).on('error', (error) => {
-            console.log(error);
-          });
-        })
-        .catch(function(error) {
-          console.log(error);
-          res.statusCode = 404;
-          return res.end('Page not found');
         });
-      };
+
+      })
+      .then((res) => {
+        var dest = res.dest;
+        if(res.new) {
+          var vhdata = '';
+          dest.on('data', (chunk) => {
+            if(socket.upgraded) return;
+            if(hasCookie) {
+              //console.log('1('+socket._pupi+') '+chunk.toString());
+              socket.write(chunk);
+            } else {
+              vhdata += chunk.toString();
+              if(vhdata.indexOf('\r\n\r\n') !== -1) {
+                var data = vhdata.split('\r\n\r\n');
+                socket.write(data[0]+'\r\nSet-Cookie: __vh='+cookie+'; Path=/; HttpOnly\r\n\r\n'+(data[1]||''));
+                //console.log('2('+socket._pupi+') '+data[0]+'\r\nSet-Cookie: __vh='+cookie+'; HttpOnly\r\n\r\n'+(data[1]||''));
+                hasCookie = true;
+                vhdata = '';
+              }
+            }
+          });
+
+          dest.on('close', () => {
+            if(socket.dests[service.dns]) dest.destroy();
+            delete socket.dests[service.dns];
+          });
+          dest.on('error', () => {
+            if(socket.dests[service.dns]) dest.destroy();
+            delete socket.dests[service.dns];
+          });
+        }
+        return dest;
+      });
+    };
+
+    var server = secure?https.createServer(options):http.createServer();
+
+    var parseCookie = function(cookie) {
+      return cookie.split(';').map(cookie=>cookie.trim().split('=')).filter(cookie=>cookie[0]=='__vh')[0];
+    };
+
+    server.on('request', function(request, response) {
+      if(!request.connection._pupi) request.connection._pupi = Math.random();
+      console.log('('+request.connection._pupi+') request '+request.url);
+      getService(request)
+      .then((service)=>{
+        return getDest(request.connection, service, request)
+        .then((dest) => {
+          var payload = Object.keys(request.headers).reduce(function (head, key) {
+            var value = request.headers[key];
+
+            if(key.toLowerCase()=='host') {
+              head.push('Host: '+service.dns);
+              return head;
+            }
+
+            if (!Array.isArray(value)) {
+              head.push(key + ': ' + value);
+              return head;
+            }
+
+            for (var i = 0; i < value.length; i++) {
+              head.push(key + ': ' + value[i]);
+            }
+            return head;
+          }, [request.method+' '+request.url.substr(service.path.length)+' HTTP/'+request.httpVersion, 'X-Forwarded-Host: '+request.headers.host, 'X-Forwarded-Proto: '+service.proto, 'X-Forwarded-Prefix: '+service.path])
+          .join('\r\n') + '\r\n\r\n';
+          dest.write(payload);
+
+          request.on('data', function(chunk) {
+            dest.write(chunk);
+          });
+        });
+      });
+    });
+    server.on('upgrade', function(request, socket, head){
+      console.log('upgraded '+request.url);
+      if(!socket._pupi) socket._pupi = Math.random();
+      socket.upgraded = true;
+      getService(request)
+      .then((service)=>{
+        return getDest(socket, service, request)
+        .then((dest) => {
+          var payload = Object.keys(request.headers).reduce(function (head, key) {
+            var value = request.headers[key];
+
+            if(key.toLowerCase()=='host') {
+              head.push('Host: '+service.dns);
+              return head;
+            }
+
+            if (!Array.isArray(value)) {
+              head.push(key + ': ' + value);
+              return head;
+            }
+
+            for (var i = 0; i < value.length; i++) {
+              head.push(key + ': ' + value[i]);
+            }
+            return head;
+          }, [request.method+' '+request.url.substr(service.path.length)+' HTTP/'+request.httpVersion, 'X-Forwarded-Host: '+request.headers.host, 'X-Forwarded-Proto: '+service.proto, 'X-Forwarded-Prefix: '+service.path])
+          .join('\r\n') + '\r\n\r\n';
+          dest.write(payload);
+          socket.pipe(dest).pipe(socket);
+        });
+      });
+    });
+    return server;
   };
 
   console.log('Child process '+process.pid);
   var cache = {};
   var svkeys = [];
 
-  var insecure = http.createServer(proxyHTTP());
-  insecure.on('upgrade', proxyWS);
+  var insecure = proxy();
   insecure.listen(80);
 
   var mkSecure = true;
@@ -301,9 +409,10 @@ if(cluster.isMaster) {
     mkSecure = false;
   }
   if(mkSecure) {
-    var secure = https.createServer({
+    var secure = proxy({
       key: key,
       cert: cert,
+      secure: true,
       SNICallback: (vhname, cb)=>{
         try {
           var _key = fs.readFileSync(path.join('run', 'secrets', vhname+'_key'));
@@ -313,8 +422,7 @@ if(cluster.isMaster) {
           cb(null, tsl.createSecureContext({key: key, cert: cert}));
         }
       }
-    }, proxyHTTP(true));
-    secure.on('upgrade', proxyWS);
+    });
     secure.listen(443);
   }
 }
