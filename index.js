@@ -288,7 +288,7 @@ if(cluster.isMaster) {
             client.lrange(service.dns+':addrs', 0, -1, function(err, addrs) {
               if(err) return dw(err);
               dw('('+socket._pupi+') Addresses found %j',addrs);
-              if(addrs.indexOf(params.host)) {
+              if(addrs.indexOf(params.host) !== -1) {
                 socket.dests[service.dns] = net.connect(params);
                 return resolve({dest: socket.dests[service.dns], new: true});
               }
